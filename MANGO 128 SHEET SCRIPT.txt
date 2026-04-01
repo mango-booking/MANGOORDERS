@@ -1,0 +1,451 @@
+/*******************************************************
+ * Mango Orders — Spreadsheet Extension Workflow (RESTORED + FULL SYNC)
+ * Paste into: Google Sheet → Extensions → Apps Script
+ *
+ * What this does:
+ * - Watches "Pending Orders" sheet. When Status changes to "Completed":
+ *   1) Sync missing details from Booking Orders by Reference # / Invoice #
+ *   2) Append the full row into "Completed Orders"
+ *   3) Delete the row from "Pending Orders"
+ *   4) Delete matching row from "Pickup Orders" or "Delivery Orders"
+ *   5) Update Booking Orders: Status=Completed and Updated At=now
+ *
+ * It does NOT touch your Web App email / invoice logic.
+ *******************************************************/
+
+/*********** SHEET NAMES (with fallback) ***********/
+const BOOKING_SHEET_PRIMARY  = 'Booking Orders';
+const BOOKING_SHEET_FALLBACK = 'Bookings';
+
+const SHEET_PENDING   = 'Pending Orders';
+const SHEET_PICKUP    = 'Pickup Orders';
+const SHEET_DELIVERY  = 'Delivery Orders';
+const SHEET_COMPLETED = 'Completed Orders';
+const SHEET_DEBUG     = 'Workflow Debug';
+
+/*********** STATUS ***********/
+const STATUS_PENDING   = 'Pending';
+const STATUS_COMPLETED = 'Completed';
+
+/*********** UI MENU ***********/
+function onOpen(){
+  SpreadsheetApp.getUi()
+    .createMenu('Mango Workflow')
+    .addItem('Setup / Fix sheets & validations', 'SETUP_SHEETS')
+    .addItem('Install onEdit trigger', 'INSTALL_TRIGGER')
+    .addSeparator()
+    .addItem('Sync active Pending row from Booking', 'SYNC_ACTIVE_PENDING_ROW')
+    .addItem('Complete active Pending row now', 'COMPLETE_ACTIVE_PENDING_ROW')
+    .addToUi();
+}
+
+/*********** SETUP ***********/
+function SETUP_SHEETS(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureSheet_(ss, SHEET_DEBUG, ['Timestamp','Level','Message','Details']);
+
+  const bookingSh = getBookingSheet_(ss);
+  const bookingHeaders = bookingSh ? getHeaders_(bookingSh) : [];
+
+  // Ensure Completed Orders exists and contains all booking headers + operational columns
+  const completedRequired = bookingHeaders.concat([
+    'Invoice link in drive','Receipt link in drive',
+    'Order Variety','Quantity','Pick up/delivery time window',
+    'Payment method','Paid date',
+    'Completed by','Completed date'
+  ]);
+
+  const pendingRequired = bookingHeaders.concat([
+    'Invoice link in drive','Receipt link in drive',
+    'Order Variety','Quantity','Pick up/delivery time window',
+    'Payment method','Paid date',
+    'Status','Completed by'
+  ]);
+
+  const pickupRequired = bookingHeaders.concat([
+    'Invoice link in drive','Receipt link in drive',
+    'Order Variety','Quantity','Pick up/delivery time window',
+    'Payment method','Paid date'
+  ]);
+
+  // Create/extend sheets (do NOT overwrite existing headers)
+  ensureHeadersContain_(ensureSheet_(ss, SHEET_COMPLETED, completedRequired), completedRequired);
+  ensureHeadersContain_(ensureSheet_(ss, SHEET_PENDING, pendingRequired), pendingRequired);
+  ensureHeadersContain_(ensureSheet_(ss, SHEET_PICKUP, pickupRequired), pickupRequired);
+
+  // Add Status dropdown validation in Pending Orders
+  const pendingSh = ss.getSheetByName(SHEET_PENDING);
+  applyStatusValidation_(pendingSh);
+
+  ss.toast('Setup done ✅', 'Mango Workflow', 6);
+  debugLog_('INFO', 'SETUP_SHEETS completed', '');
+}
+
+/*********** TRIGGER ***********/
+function INSTALL_TRIGGER(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Remove existing triggers for handler
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'onEditPendingStatus_') ScriptApp.deleteTrigger(t);
+  });
+
+  ScriptApp.newTrigger('onEditPendingStatus_')
+    .forSpreadsheet(ss)
+    .onEdit()
+    .create();
+
+  ss.toast('Trigger installed ✅', 'Mango Workflow', 6);
+  debugLog_('INFO', 'Trigger installed', 'Handler=onEditPendingStatus_');
+}
+
+/*********** TRIGGER HANDLER ***********/
+function onEditPendingStatus_(e){
+  try{
+    if (!e || !e.range) return;
+    const sh = e.range.getSheet();
+    if (sh.getName() !== SHEET_PENDING) return;
+
+    const headers = getHeaders_(sh);
+    const statusCol = findCol_(headers, ['Status']);
+    if (!statusCol) return;
+
+    if (e.range.getColumn() !== statusCol) return;
+    if (e.range.getRow() < 2) return;
+
+    const newVal = String(e.value || e.range.getDisplayValue() || '').trim();
+    debugLog_('INFO', 'Status edited', `Row=${e.range.getRow()} Value="${newVal}"`);
+
+    if (newVal !== STATUS_COMPLETED) return;
+
+    completeFromPending_(e.source || SpreadsheetApp.getActiveSpreadsheet(), e.range.getRow());
+
+  }catch(err){
+    debugLog_('ERROR', 'onEditPendingStatus_ failed', err && err.stack ? err.stack : String(err));
+    SpreadsheetApp.getActive().toast(String(err.message || err), 'Mango Workflow Error', 10);
+    throw err;
+  }
+}
+
+/*********** MANUAL UTILITIES ***********/
+function SYNC_ACTIVE_PENDING_ROW(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getActiveSheet();
+  if (sh.getName() !== SHEET_PENDING){
+    ss.toast('Open "Pending Orders" and select a row.', 'Mango Workflow', 6);
+    return;
+  }
+  const row = sh.getActiveRange().getRow();
+  if (row < 2){
+    ss.toast('Select a data row (not header).', 'Mango Workflow', 6);
+    return;
+  }
+  syncPendingRowFromBooking_(ss, row);
+  ss.toast('Synced ✅', 'Mango Workflow', 4);
+}
+
+function COMPLETE_ACTIVE_PENDING_ROW(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getActiveSheet();
+  if (sh.getName() !== SHEET_PENDING){
+    ss.toast('Open "Pending Orders" and select a row.', 'Mango Workflow', 6);
+    return;
+  }
+  const row = sh.getActiveRange().getRow();
+  if (row < 2){
+    ss.toast('Select a data row (not header).', 'Mango Workflow', 6);
+    return;
+  }
+  completeFromPending_(ss, row);
+  ss.toast('Completed ✅', 'Mango Workflow', 6);
+}
+
+/*********** CORE ***********/
+function completeFromPending_(ss, pendingRow){
+  const pendingSh = ss.getSheetByName(SHEET_PENDING);
+  if (!pendingSh) throw new Error('Pending Orders sheet not found.');
+
+  // 1) Sync missing details first (so Completed gets EVERYTHING)
+  const bookingMatch = syncPendingRowFromBooking_(ss, pendingRow);
+
+  // 2) Read the pending row AFTER sync
+  const pendingHeaders = getHeaders_(pendingSh);
+  const pendingObj = readRowAsObject_(pendingSh, pendingRow, pendingHeaders);
+
+  const ref = normalizeKey_(pendingObj['Reference #'] || pendingObj['Reference'] || '');
+  const inv = normalizeKey_(pendingObj['Invoice #'] || pendingObj['Invoice'] || '');
+
+  // 3) Append to Completed (copy full pending row by headers, plus completed meta)
+  const completedSh = ss.getSheetByName(SHEET_COMPLETED) || ensureSheet_(ss, SHEET_COMPLETED, pendingHeaders.concat(['Completed by','Completed date']));
+  // Ensure completed has all pending headers (and add missing columns if needed)
+  ensureHeadersContain_(completedSh, pendingHeaders.concat(['Completed by','Completed date']));
+
+  const completedHeaders = getHeaders_(completedSh);
+  const completedDate = new Date();
+
+  // Build completed row
+  const completedRow = completedHeaders.map(h => {
+    if (h === 'Completed date') return completedDate;
+    if (h === 'Completed by') return ''; // you can type later
+    // Prefer pending row values
+    if (pendingObj.hasOwnProperty(h)) return pendingObj[h];
+    // If missing in pending, try booking
+    if (bookingMatch && bookingMatch.obj && bookingMatch.obj.hasOwnProperty(h)) return bookingMatch.obj[h];
+    return '';
+  });
+
+  completedSh.appendRow(completedRow);
+
+  // 4) Delete from Pending
+  pendingSh.deleteRow(pendingRow);
+
+  // 5) Delete from Pickup / Delivery and update their Status (optional)
+  const fulfillment = String((bookingMatch && bookingMatch.obj && bookingMatch.obj['Fulfillment']) || pendingObj['Fulfillment'] || pendingObj['Pick up or deliver'] || '').toLowerCase();
+  if (fulfillment.includes('deliver')){
+    deleteRowByKeys_(ss.getSheetByName(SHEET_DELIVERY), ref, inv);
+  } else {
+    deleteRowByKeys_(ss.getSheetByName(SHEET_PICKUP), ref, inv);
+  }
+
+  // 6) Update Booking Orders status
+  if (bookingMatch && bookingMatch.sheet && bookingMatch.row){
+    const bookingSh = bookingMatch.sheet;
+    const bookingHeaders = getHeaders_(bookingSh);
+
+    const statusCol = findCol_(bookingHeaders, ['Status']);
+    const updatedCol = findCol_(bookingHeaders, ['Updated At','UpdatedAt']);
+    if (!statusCol) throw new Error('Booking Orders missing Status column.');
+
+    bookingSh.getRange(bookingMatch.row, statusCol).setValue(STATUS_COMPLETED);
+    if (updatedCol) bookingSh.getRange(bookingMatch.row, updatedCol).setValue(completedDate);
+  }
+
+  debugLog_('INFO', 'Completed flow finished', `Ref=${ref} Inv=${inv}`);
+}
+
+/**
+ * Fills missing cells in Pending Orders from Booking Orders using Reference # or Invoice #.
+ * Returns {sheet,row,obj} for the matched booking row.
+ */
+function syncPendingRowFromBooking_(ss, pendingRow){
+  const pendingSh = ss.getSheetByName(SHEET_PENDING);
+  const bookingSh = getBookingSheet_(ss);
+  if (!bookingSh) throw new Error('Booking Orders sheet not found.');
+
+  const pendingHeaders = getHeaders_(pendingSh);
+  const bookingHeaders = getHeaders_(bookingSh);
+
+  const pendingObj = readRowAsObject_(pendingSh, pendingRow, pendingHeaders);
+
+  const ref = normalizeKey_(pendingObj['Reference #'] || pendingObj['Reference'] || '');
+  const inv = normalizeKey_(pendingObj['Invoice #'] || pendingObj['Invoice'] || '');
+
+  const bookingIndex = buildBookingIndex_(bookingSh);
+
+  let matchRow = null;
+  if (ref && bookingIndex.byRef.has(ref)) matchRow = bookingIndex.byRef.get(ref);
+  if (!matchRow && inv && bookingIndex.byInv.has(inv)) matchRow = bookingIndex.byInv.get(inv);
+
+  // Fallback: scan all tokens in the pending row if needed
+  if (!matchRow){
+    const tokens = Object.values(pendingObj).map(v => normalizeKey_(v)).filter(Boolean);
+    for (const t of tokens){
+      if (bookingIndex.byRef.has(t)) { matchRow = bookingIndex.byRef.get(t); break; }
+      if (bookingIndex.byInv.has(t)) { matchRow = bookingIndex.byInv.get(t); break; }
+    }
+  }
+
+  if (!matchRow){
+    debugLog_('ERROR', 'No match in Booking Orders for pending row', `PendingRow=${pendingRow} Ref=${ref} Inv=${inv}`);
+    throw new Error('Could not match Pending row to Booking Orders (missing Reference # / Invoice # match).');
+  }
+
+  const bookingObj = readRowAsObjectByRow_(bookingSh, matchRow);
+
+  // Fill each pending column if blank, using booking values where header matches
+  for (let c=1; c<=pendingHeaders.length; c++){
+    const h = pendingHeaders[c-1];
+    const current = pendingSh.getRange(pendingRow, c).getValue();
+    if (current !== '' && current !== null && current !== undefined) continue;
+
+    // If this header exists in booking, copy it
+    if (bookingObj.hasOwnProperty(h)){
+      pendingSh.getRange(pendingRow, c).setValue(bookingObj[h]);
+      continue;
+    }
+
+    // Common alias fills
+    if (h === 'Date of order' && bookingObj['Timestamp']) pendingSh.getRange(pendingRow, c).setValue(bookingObj['Timestamp']);
+    if (h === 'Customer Name' && bookingObj['Name']) pendingSh.getRange(pendingRow, c).setValue(bookingObj['Name']);
+    if (h === 'Customer Phone' && bookingObj['Phone']) pendingSh.getRange(pendingRow, c).setValue(bookingObj['Phone']);
+    if (h === 'Customer Email' && bookingObj['Email']) pendingSh.getRange(pendingRow, c).setValue(bookingObj['Email']);
+
+    if (h === 'Order Variety' && bookingObj['Line Items JSON']) pendingSh.getRange(pendingRow, c).setValue(stringifyLineItems_(bookingObj['Line Items JSON']));
+    if (h === 'Quantity' && bookingObj['Total Qty']) pendingSh.getRange(pendingRow, c).setValue(bookingObj['Total Qty']);
+
+    if (h === 'Pick up or deliver' && bookingObj['Fulfillment']) pendingSh.getRange(pendingRow, c).setValue(bookingObj['Fulfillment']);
+    if (h === 'Pick up or delivery date' && bookingObj['Date']) pendingSh.getRange(pendingRow, c).setValue(bookingObj['Date']);
+
+    if (h === 'Pick up/delivery time window'){
+      const win = bookingObj['Delivery Window'] || bookingObj['Time'] || '';
+      if (win) pendingSh.getRange(pendingRow, c).setValue(win);
+    }
+
+    if (h === 'Paid date'){
+      const adv = String(bookingObj['Advance Payment'] || '').toLowerCase();
+      const pd = bookingObj['Payment Date'] || '';
+      const pt = bookingObj['Payment Time'] || '';
+      if (adv === 'yes') pendingSh.getRange(pendingRow, c).setValue([pd,pt].filter(Boolean).join(' ') || pd || '');
+      else pendingSh.getRange(pendingRow, c).setValue('Pending');
+    }
+
+    if (h === 'Payment method'){
+      const adv = String(bookingObj['Advance Payment'] || '').toLowerCase() === 'yes';
+      const fulf = String(bookingObj['Fulfillment'] || '').toLowerCase();
+      const pm = adv ? 'Advance Payment' : (fulf.includes('deliver') ? 'Paid at Delivery' : 'Paid at Pickup');
+      pendingSh.getRange(pendingRow, c).setValue(pm);
+    }
+  }
+
+  applyStatusValidation_(pendingSh);
+
+  debugLog_('INFO', 'Pending row synced from Booking', `PendingRow=${pendingRow} BookingRow=${matchRow}`);
+  return { sheet: bookingSh, row: matchRow, obj: bookingObj };
+}
+
+/*********** HELPERS ***********/
+function getBookingSheet_(ss){
+  return ss.getSheetByName(BOOKING_SHEET_PRIMARY) || ss.getSheetByName(BOOKING_SHEET_FALLBACK);
+}
+
+function ensureSheet_(ss, name, headers){
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (sh.getLastRow() === 0 && headers && headers.length){
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+  }
+  return sh;
+}
+
+function ensureHeadersContain_(sh, required){
+  const existing = getHeaders_(sh);
+  const existingNorm = existing.map(normalizeKey_);
+  let changed = false;
+
+  required.forEach(h => {
+    if (!h) return;
+    const hn = normalizeKey_(h);
+    if (existingNorm.indexOf(hn) === -1){
+      existing.push(h);
+      existingNorm.push(hn);
+      changed = true;
+    }
+  });
+
+  if (changed){
+    sh.getRange(1,1,1,existing.length).setValues([existing]);
+  }
+}
+
+function getHeaders_(sh){
+  const lc = sh.getLastColumn();
+  if (!lc) return [];
+  return sh.getRange(1,1,1,lc).getValues()[0].map(v => String(v||'').trim());
+}
+
+function findCol_(headers, names){
+  const norm = headers.map(normalizeKey_);
+  for (const n of names){
+    const idx = norm.indexOf(normalizeKey_(n));
+    if (idx >= 0) return idx + 1;
+  }
+  return 0;
+}
+
+function readRowAsObject_(sh, row, headers){
+  const vals = sh.getRange(row, 1, 1, headers.length).getValues()[0];
+  const obj = {};
+  headers.forEach((h,i)=> obj[h] = vals[i]);
+  return obj;
+}
+
+function readRowAsObjectByRow_(sh, row){
+  const headers = getHeaders_(sh);
+  const vals = sh.getRange(row,1,1,headers.length).getValues()[0];
+  const obj = {};
+  headers.forEach((h,i)=> obj[h] = vals[i]);
+  return obj;
+}
+
+function normalizeKey_(v){
+  return String(v || '').trim().toLowerCase().replace(/[^a-z0-9#]+/g,'');
+}
+
+function buildBookingIndex_(bookingSh){
+  const headers = getHeaders_(bookingSh);
+  const refCol = findCol_(headers, ['Reference #','Reference']);
+  const invCol = findCol_(headers, ['Invoice #','Invoice']);
+  const lastRow = bookingSh.getLastRow();
+  const idx = { byRef: new Map(), byInv: new Map() };
+  if (lastRow < 2) return idx;
+
+  const data = bookingSh.getRange(2,1,lastRow-1,bookingSh.getLastColumn()).getValues();
+  for (let i=0;i<data.length;i++){
+    const rowNum = i+2;
+    const ref = refCol ? normalizeKey_(data[i][refCol-1]) : '';
+    const inv = invCol ? normalizeKey_(data[i][invCol-1]) : '';
+    if (ref) idx.byRef.set(ref, rowNum);
+    if (inv) idx.byInv.set(inv, rowNum);
+  }
+  return idx;
+}
+
+function deleteRowByKeys_(sh, refKey, invKey){
+  if (!sh) return;
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2) return;
+
+  const data = sh.getRange(2,1,lastRow-1,lastCol).getValues();
+  for (let i=data.length-1; i>=0; i--){
+    const rowVals = data[i].map(v => normalizeKey_(v));
+    if ((refKey && rowVals.indexOf(refKey) >= 0) || (invKey && rowVals.indexOf(invKey) >= 0)){
+      sh.deleteRow(i+2);
+      debugLog_('INFO', 'Deleted from ' + sh.getName(), `Row=${i+2}`);
+      return;
+    }
+  }
+}
+
+function applyStatusValidation_(pendingSh){
+  if (!pendingSh) return;
+  const headers = getHeaders_(pendingSh);
+  const statusCol = findCol_(headers, ['Status']);
+  if (!statusCol) return;
+
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList([STATUS_PENDING, STATUS_COMPLETED], true)
+    .setAllowInvalid(false)
+    .build();
+
+  const lr = Math.max(pendingSh.getLastRow(), 2);
+  pendingSh.getRange(2, statusCol, lr-1, 1).setDataValidation(rule);
+}
+
+function stringifyLineItems_(jsonText){
+  try{
+    const arr = JSON.parse(jsonText);
+    if (!Array.isArray(arr)) return '';
+    return arr.map(li => `${li.variety} x${li.qty}`).join('; ');
+  }catch(_e){
+    return String(jsonText || '');
+  }
+}
+
+function debugLog_(level, message, details){
+  try{
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName(SHEET_DEBUG) || ensureSheet_(ss, SHEET_DEBUG, ['Timestamp','Level','Message','Details']);
+    sh.appendRow([new Date(), level, message, String(details || '')]);
+  }catch(_e){}
+}

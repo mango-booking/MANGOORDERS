@@ -1,0 +1,2275 @@
+/** Mango Booking — single email when owner==customer, company-title invoice, PDF receipt inline
+ *  - If customer's email === OWNER_EMAIL => send ONE combined email (single PDF attached)
+ *  - Invoice shows BUSINESS_NAME as H1 (no file name printed inside)
+ *  - Receipt: embed images; for PDFs try Advanced Drive thumbnail → PNG embed
+ *  - Friendly file names: "<Name>'s order for 13th November 2025 – Invoice.pdf"
+ */
+
+// ======= CONFIGURE =======
+const SHEET_ID        = '1TO7zoWrDfXQUuvRjQV78EhAx72iraAX4lnLxMVwGMiE';
+const SHEET_NAME      = 'Booking Orders';
+const DELIVERY_SHEET_NAME = 'Delivery Orders';
+const CALENDAR_ID     = 'primary';
+const OWNER_EMAIL     = 'aditi.ingole87@gmail.com';
+const BUSINESS_NAME   = 'Harmin Mangoes';
+const DELIVERY_FEE    = 10;     // CAD
+const TAX_RATE        = 0;      // 0 if you don’t charge tax
+const TAX_ON_DELIVERY = true;   // false if delivery not taxable
+const DRIVE_FOLDER_ID = '1S4RmtZeVMmtSa8P9HfAdGiwt5keMypH9';
+const ADVANCE_DISCOUNT_PER_BOX = 1.0;
+
+const PRICES = {
+  'Alphonso (Apoos)': 50,
+  'Kesar'            : 40,
+  'Badami'           : 35,
+  'Langra'           : 30,
+  'Dasheri'          : 20,
+};
+
+/**
+ * Builds a price map from the live Config_Varieties sheet (so backend totals always match the booking page).
+ * Falls back to the hard-coded PRICES if config sheet is missing/empty.
+ */
+function getLivePricesMap_(ss){
+  try{
+    const arr = readConfigVarieties_(ss);
+    const map = {};
+    (arr || []).forEach(v=>{
+      const name = String(v && v.name || '').trim();
+      if (!name) return;
+      const active = (v && typeof v.active !== 'undefined') ? !!v.active : true;
+      if (!active) return;
+      map[name] = Number(v.price || 0);
+    });
+    return Object.keys(map).length ? map : PRICES;
+  } catch(err){
+    return PRICES;
+  }
+}
+
+
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+// ==========================
+
+
+function getOrCreateSheet_(ss, name, headers){
+  let sh = ss.getSheetByName(name);
+  if (!sh){
+    sh = ss.insertSheet(name);
+  }
+  // Do NOT rewrite headers for Delivery Orders (user-managed headers)
+  if (String(name||'').trim() === String(DELIVERY_SHEET_NAME||'').trim()) return sh;
+  // Ensure headers row exists (and includes all headers in correct order)
+  const lastCol = headers.length;
+  if (sh.getLastRow() === 0){
+    sh.getRange(1,1,1,lastCol).setValues([headers]);
+    return sh;
+  }
+  const existing = sh.getRange(1,1,1,Math.max(sh.getLastColumn(), lastCol)).getValues()[0];
+  const existingTrimmed = existing.slice(0, lastCol);
+  let needsUpdate = false;
+  for (let i=0;i<headers.length;i++){
+    if ((existingTrimmed[i]||'').toString().trim() !== headers[i]){ needsUpdate = true; break; }
+  }
+  if (needsUpdate){
+    sh.getRange(1,1,1,lastCol).setValues([headers]);
+  }
+  return sh;
+}
+
+
+function doGet(e){
+  e = e || { parameter: {} };
+  const p = e.parameter || {};
+  const action = String(p.action || '').trim();
+  const page   = String(p.page || '').trim();
+
+  // Serve Admin / Manage pages (these are HtmlService files in your Apps Script project)
+  if (page === 'admin'){
+    const t = HtmlService.createTemplateFromFile('admin');
+    t.WEB_APP_URL = ScriptApp.getService().getUrl();
+    return t.evaluate()
+      .setTitle('Mango Admin Console')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+  if (page === 'manage'){
+    const t = HtmlService.createTemplateFromFile('manage');
+    t.WEB_APP_URL = ScriptApp.getService().getUrl();
+    return t.evaluate()
+      .setTitle('Manage Booking')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+
+  // JSON API
+  try{
+    if (action){
+      switch(action){
+        case 'getConfig':    return json_(api_getConfig_());
+        case 'checkConfirm':{
+          var rid = String(p.requestId || p.clientRequestId || '').trim();
+          var cb  = String(p.callback || p.cb || '').trim();
+          if (!rid) return jsCallback_(cb, { ok:false, error:'Missing requestId' });
+          var v = CacheService.getScriptCache().get('confirm_'+rid);
+          return jsCallback_(cb, { ok:true, confirmed: v === '1' });
+        }
+        case 'listOrders':   return json_(api_listOrders_(p));
+        case 'getBooking':   return json_(api_getBooking_(p));
+        default:             return json_({ ok:false, error:'Unknown action: ' + action });
+      }
+    }
+    return json_({ ok:true, message:'OK. Use POST to submit booking, or ?page=admin / ?page=manage' });
+  } catch(err){
+    return json_({ ok:false, error:String(err && err.message ? err.message : err) });
+  }
+}
+
+
+function doPost(e){
+  // Admin/Manage API actions are JSON-only. Booking submissions are form-encoded / multipart.
+  try{
+    const isJson = e && e.postData && e.postData.type && String(e.postData.type).indexOf('application/json') === 0;
+    if (isJson){
+      const params = (e && e.parameter) ? e.parameter : {};
+      const action = String(params.action || '').trim();
+      if (action){
+        const result = api_handlePostAction_(action, e);
+        return json_(result);
+      }
+      return json_({ ok:false, error:'Missing action for JSON POST' });
+    }
+  } catch(apiErr){
+    return json_({ ok:false, error:String(apiErr && apiErr.message ? apiErr.message : apiErr) });
+  }
+
+  try{
+    // --- Parse ---
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    let sheet = ss.getSheetByName(SHEET_NAME);
+    if (!sheet) throw new Error('Sheet not found. Check SHEET_ID/SHEET_NAME.');
+    const fields = parseForm(e);
+
+    const name    = (fields.name || '').trim();
+    const email   = (fields.email || '').trim();
+    const phone   = (fields.phone || '').trim();
+    const notes   = (fields.notes || '').trim();
+
+    const fulfillment    = (fields.fulfillment || 'Pickup').trim();
+    const isDelivery     = /delivery/i.test(fulfillment);
+    const dateStr        = (fields.date || '').trim();        // yyyy-mm-dd (customer selected)
+    const timeStr        = (fields.time || '').trim();        // HH:mm
+    const deliveryWindow = ((fields.deliveryTimeForSheet || fields.deliveryWindow || '') + '').trim();
+
+    const deliveryStreet = (fields.deliveryStreet || '').trim();
+    const deliveryUnit   = (fields.deliveryUnit || '').trim();
+    const deliveryCity   = (fields.deliveryCity || '').trim();
+    const deliveryPostal = (fields.deliveryPostal || '').trim();
+    const deliveryBuzzer = (fields.deliveryBuzzer || '').trim();
+    const isoDateTime    = (fields.isoDateTime || '').trim();
+
+    const advancePayment = (fields.advancePayment || 'No').trim();
+    const amountPaid     = round2(Number(fields.amount || '0'));
+    const etransferId    = (fields.etransferId || '').trim();
+    const paymentDate    = (fields.paymentDate || '').trim();
+    const paymentTime    = (fields.paymentTime || '').trim();
+
+    // --- Delivery-only fields validation ---
+    if (isDelivery){
+      if (!deliveryWindow) throw new Error('Please select a delivery time window.');
+      if (!deliveryStreet || !deliveryCity || !deliveryPostal){
+        throw new Error('Please enter the delivery address (Street Name & Number, City, and Postal Code).');
+      }
+    }
+
+
+    // Date objects: use the customer's chosen date/time
+    const start = isoDateTime ? new Date(isoDateTime) : makeDateFromLocal(dateStr, timeStr);
+    const end   = new Date(start.getTime() + 30*60*1000);
+
+    // Friendly file base name (customer name + selected date)
+    const baseName = makeBaseNameForDate(name, start, fulfillment); // "<Name>'s order for 13th November 2025"
+
+    // --- Items + totals ---
+    const livePrices = getLivePricesMap_(ss);
+    const lineItems = buildLineItemsFromFields(fields, livePrices);
+    if (lineItems.length === 0) throw new Error('Please select at least one mango variety with a positive quantity.');
+
+    const totalQty       = lineItems.reduce((s,li)=>s + li.qty, 0);
+    const subtotalBoxes  = round2(lineItems.reduce((s,li)=>s + li.line, 0));
+    const deliveryFee    = (isDelivery) ? DELIVERY_FEE : 0;
+
+    const advanceDiscount = (advancePayment === 'Yes' && lineItems.length>0)
+      ? round2(totalQty * ADVANCE_DISCOUNT_PER_BOX) : 0;
+
+    const preTaxSubtotal = Math.max(0, round2(subtotalBoxes + deliveryFee - advanceDiscount));
+    const taxableBase    = TAX_ON_DELIVERY ? preTaxSubtotal : Math.max(0, round2(subtotalBoxes - advanceDiscount));
+    const tax            = round2(taxableBase * TAX_RATE);
+    const total          = round2(preTaxSubtotal + tax);
+// Payment rules (must match booking page):
+    // - If Advance Payment = Yes: use the amount user entered (cap at total). If blank/0, default to total.
+    // - If Pay at pickup/delivery: paid now = 0; balance = total
+    const advSelected = (advancePayment === 'Yes');
+    let paid = 0;
+
+    if (advSelected){
+      const raw = Number(fields.amount || 0); // booking page "Paid in advance" field
+      paid = round2(raw);
+      if (!(paid > 0)) paid = total;         // if user left it blank, assume full payment
+      if (paid > total) paid = total;        // never allow paid > total
+    } else {
+      paid = 0;
+    }
+
+    paid = round2(paid);
+    const balanceDue = Math.max(0, round2(total - paid));
+
+    // --- Receipt upload (image inline; PDF → try Drive thumbnail PNG) ---
+    let receiptUrl = '';
+    let receiptEmbedDataUrl = '';
+    let receiptDiag = { present:false, bytes:0, name:'', type:'', saved:false };
+    let receiptAttachmentBlob = null;
+
+    const parentFolder   = getDriveParentFolder();
+    const receiptsFolder = getOrCreateSubfolder(parentFolder, 'Receipts');
+
+    // A) multipart file
+    if (fields._files && fields._files.receipt) {
+      const blob  = fields._files.receipt;
+      const bytes = blob.getBytes().length;
+      const mime  = (blob.getContentType && blob.getContentType()) || 'application/octet-stream';
+      const originalName = (blob.getName && blob.getName()) || 'receipt';
+      receiptDiag = { present:true, bytes, name: originalName, type: mime, saved:false };
+
+      if (bytes > 0) {
+        if (bytes > MAX_UPLOAD_BYTES) throw new Error('Uploaded file exceeds 10MB.');
+        const ext = guessExtFromMime(mime) || fileExt(originalName) || 'bin';
+        const saved = receiptsFolder.createFile(blob);
+        saved.setName(baseName + ' – Receipt.' + ext);
+        saved.setDescription('Mango receipt for ' + name + (etransferId ? ' | ' + etransferId : ''));
+        receiptUrl = saved.getUrl();
+        receiptDiag.saved = true;
+        receiptAttachmentBlob = saved.getBlob();
+        receiptAttachmentBlob = saved.getBlob();
+
+        // Try rasterize for embedding
+        receiptEmbedDataUrl = rasterizeToPngDataUrl(saved.getBlob(), mime);
+        if (!receiptEmbedDataUrl && mime === 'application/pdf') {
+          // Try Advanced Drive thumbnail
+          const thumb = tryPdfThumbnailDataUrl_(saved.getId());
+          if (thumb) receiptEmbedDataUrl = thumb;
+        }
+      }
+    }
+    // B) Base64 fallback
+    if (!receiptDiag.present && fields.receipt_b64) {
+      try{
+        const b64   = String(fields.receipt_b64 || '');
+        const mime2 = String(fields.receipt_type || 'application/octet-stream');
+        const fname = String(fields.receipt_name || 'receipt');
+        const bytes = Utilities.base64Decode(b64);
+        receiptDiag = { present:true, bytes:bytes.length, name: fname, type: mime2, saved:false };
+        if (bytes.length > MAX_UPLOAD_BYTES) throw new Error('Uploaded file exceeds 10MB.');
+        const ext2  = guessExtFromMime(mime2) || fileExt(fname) || 'bin';
+        const saved = receiptsFolder.createFile(Utilities.newBlob(bytes, mime2, fname));
+        saved.setName(baseName + ' – Receipt.' + ext2);
+        saved.setDescription('Mango receipt (b64) for ' + name + (etransferId ? ' | ' + etransferId : ''));
+        receiptUrl = saved.getUrl();
+        receiptDiag.saved = true;
+        receiptAttachmentBlob = saved.getBlob();
+
+        receiptEmbedDataUrl = rasterizeToPngDataUrl(saved.getBlob(), mime2);
+        if (!receiptEmbedDataUrl && mime2 === 'application/pdf') {
+          const thumb2 = tryPdfThumbnailDataUrl_(saved.getId());
+          if (thumb2) receiptEmbedDataUrl = thumb2;
+        }
+      }catch(errB64){
+        console.error('b64 receipt decode failed: ' + errB64);
+      }
+    }
+
+    // --- Calendar event ---
+    const cal = CalendarApp.getCalendarById(CALENDAR_ID);
+    if (!cal) throw new Error('Calendar not found. Check CALENDAR_ID.');
+    const title = (isDelivery ? 'Mango Delivery' : 'Mango Pickup') + ' – ' + name;
+    const desc  = [
+      'Customer: ' + name + ' (' + phone + ')',
+      'Order: ' + lineItems.map(li => li.variety + ' x ' + li.qty).join(', '),
+      'Totals: Sub ' + fmt(subtotalBoxes) + ', Del ' + fmt(deliveryFee) + ', Disc ' + fmt(advanceDiscount) + ', Tax ' + fmt(tax) + ', Total ' + fmt(total),
+      'Payment: Paid ' + fmt(paid) + (etransferId ? ' (ID: ' + etransferId + ')' : '') + ((paymentDate||paymentTime) ? ' on ' + [paymentDate, paymentTime].filter(Boolean).join(' ') : ''),
+      'Balance Due: ' + fmt(balanceDue),
+      'Mode: ' + fulfillment + (deliveryWindow ? ' | Window: ' + deliveryWindow : ''),
+      notes ? ('Notes: ' + notes) : '',
+      receiptUrl ? ('Receipt: ' + receiptUrl) : ''
+    ].filter(Boolean).join('\n');
+    const event = cal.createEvent(title, start, end, { description: desc });
+    event.addPopupReminder(60);
+
+    // --- Invoice number ---
+    const invoiceNumber = 'INV-' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss');
+
+    // --- Short Reference # (4 digits) ---
+    const referenceNumber = generateShortRef_(ss, SHEET_NAME, 'Reference #');
+
+    // --- Sheet append ---
+    const headers = [
+      'Timestamp','Invoice #','Name','Email','Phone',
+      'Fulfillment','Date','Time','Delivery Window',
+      'Advance Payment','Advance Discount','Total Qty',
+      'Line Items JSON','Subtotal Boxes','Delivery Fee','Tax','Total','Paid','Balance Due',
+      'eTransfer ID','Payment Date','Payment Time','Notes','Receipt URL','Event ID',
+      'Reference #','Status','Delivery Street','Delivery Unit','Delivery City','Delivery Postal','Delivery Buzzer','Updated At'
+    ];
+    sheet = getOrCreateSheet_(ss, SHEET_NAME, headers);
+
+    sheet.appendRow([
+      new Date(), invoiceNumber, name, email, phone,
+      fulfillment, dateStr, timeStr, deliveryWindow,
+      advancePayment, advanceDiscount, totalQty,
+      JSON.stringify(lineItems), subtotalBoxes, deliveryFee, tax, total, paid, balanceDue,
+      etransferId, paymentDate, paymentTime, notes, receiptUrl, event.getId(), referenceNumber, 'Pending', deliveryStreet, deliveryUnit, deliveryCity, deliveryPostal, deliveryBuzzer, new Date()
+    ]);
+
+    // --- Delivery Orders sheet (separate, sorted by date then city) ---
+    if (isDelivery){
+      const deliveryHeaders = [
+        'Delivery Date','Delivery Time Window',
+        'Street Name & Number','Suite Number','City','Postal Code','Buzzer Code',
+        'Customer Name','Customer Phone','Customer Email',
+        'Order Variety','Quantity','Total',
+        'Payment Option Selected','Paid in Advance','Notes',
+        'Invoice #','Reference #','Status','Timestamp','Delivery Start (24h)'
+      ];
+      const deliverySheet = getOrCreateSheet_(ss, DELIVERY_SHEET_NAME, deliveryHeaders);
+
+            const deliveryTimeLabel = (deliveryWindow || (timeStr ? timeStartToWindow_(timeStr) : '') || '').trim();
+      const deliveryStart24h = windowLabelToStart24h_(deliveryTimeLabel) || (timeStr || '');
+const orderSummary = lineItems.map(li => `${li.variety} x${li.qty}`).join('; ');
+      const paymentOptionSelected = (advancePayment === 'Yes') ? 'Advance e-Transfer' : 'Pay at pickup/delivery';
+      // Sort (keep header row)
+      const lastRow = deliverySheet.getLastRow();
+      if (lastRow > 2){
+        const range = deliverySheet.getRange(2,1,lastRow-1,deliveryHeaders.length);
+        range.sort([{column:1,ascending:true},{column:deliveryHeaders.length,ascending:true},{column:5,ascending:true}]);
+      }
+    }
+
+
+    // --- Build Invoice HTML -> PDF (company title; no file name in content) ---
+    const invoiceHtml = buildInvoiceHtml({
+      invoiceNumber: invoiceNumber,
+      referenceNumber: referenceNumber,
+      businessName : BUSINESS_NAME,
+      name: name, email: email, phone: phone,
+      fulfillment: fulfillment, date: dateStr, time: timeStr, deliveryWindow: deliveryWindow,
+      isDelivery: isDelivery,
+      deliveryStreet: deliveryStreet, deliveryUnit: deliveryUnit, deliveryCity: deliveryCity, deliveryPostal: deliveryPostal, deliveryBuzzer: deliveryBuzzer,
+      lineItems: lineItems, totalQty: totalQty,
+      subtotalBoxes: subtotalBoxes, deliveryFee: deliveryFee, advanceDiscount: advanceDiscount,
+      tax: tax, total: total, paid: paid, balanceDue: balanceDue,
+      advancePayment: advancePayment, etransferId: etransferId, paymentDate: paymentDate, paymentTime: paymentTime,
+      receiptUrl: receiptUrl, receiptEmbedDataUrl: receiptEmbedDataUrl
+    });
+    const pdfBlob = HtmlService.createHtmlOutput(invoiceHtml).getBlob().getAs('application/pdf');
+
+    const invoicesFolder = getOrCreateSubfolder(parentFolder, 'Invoices');
+    const invoiceFileName = baseName + ' – Invoice.pdf';
+    const savedPdf = invoicesFolder.createFile(pdfBlob.setName(invoiceFileName));
+    const pdfAttachment = savedPdf.getBlob(); // attachment used below
+
+// --- Operational sheets (Pickup Orders + Pending Orders) ---
+// NOTE: This does NOT change your emails/invoice/calendar logic.
+try{
+  const invoiceUrl = savedPdf.getUrl();
+  const orderSummary = lineItems.map(li => `${li.variety} x${li.qty}`).join('; ');
+  const varietyText  = lineItems.map(li => li.variety).join('; ');
+  const quantityText = lineItems.map(li => `${li.variety} x${li.qty}`).join('; ');
+
+  const paymentOptionSelected = (advancePayment === 'Yes') ? 'Advance payment' : 'Pending';
+
+  const paidDateForSheets = (advancePayment === 'Yes')
+    ? [paymentDate, paymentTime].filter(Boolean).join(' ')
+    : 'Pending';
+
+  appendOrderToOperationalSheets({
+    sheetId: SHEET_ID,
+    bookingSheetName: SHEET_NAME,
+    deliverySheetName: DELIVERY_SHEET_NAME,
+    refNo: referenceNumber,
+    invoiceNumber: invoiceNumber,
+    mode: fulfillment,                 // "Pickup" or "Delivery"
+    dateOfOrder: new Date(),
+    name: name,
+    phone: phone,
+    email: email,
+    orderVariety: varietyText,         // e.g. "Langra; Kesar"
+    quantity: quantityText,            // e.g. "1; 2"
+    orderSummary: orderSummary,        // e.g. "Langra x1; Kesar x2"
+    totalAmount: total,
+    amountPaid: paid,
+    remainingBalance: balanceDue,
+    paymentOptionSelected: paymentOptionSelected,
+    paidDate: paidDateForSheets,
+    advancePayment: advancePayment,
+    pickupDate: (!isDelivery ? dateStr : ''),
+    pickupTimeWindow: (!isDelivery ? (timeStr || '') : ''),
+    deliveryDate: (isDelivery ? dateStr : ''),
+    deliveryTimeWindow: (isDelivery ? (deliveryWindow || '') : ''),
+    invoiceUrl: invoiceUrl,
+    receiptUrl: receiptUrl
+  });
+} catch(sheetErr){
+  console.error('Operational sheets append failed: ' + sheetErr);
+}
+
+    // --- Emails ---
+    const sameRecipient = email && OWNER_EMAIL && email.toLowerCase() === OWNER_EMAIL.toLowerCase();
+    const subjectBase = baseName + ' – ' + invoiceNumber;
+
+    if (sameRecipient) {
+      // Send ONE email only, combined message
+      GmailApp.sendEmail(
+        OWNER_EMAIL,
+        'Mango Booking (Owner & Customer copy): ' + subjectBase,
+        'Please view this email in HTML; invoice is attached.',
+        { htmlBody:
+            '<div style="font-family:Arial,Helvetica,sans-serif;color:#111">' +
+            '<h2>New Mango Booking</h2>' +
+            '<p><strong>' + name + '</strong> (' + (email||'no-email') + ', ' + phone + ')</p>' +
+            '<p>Invoice: <strong>' + invoiceNumber + '</strong></p>' +
+            '<p>Reference: <strong>' + referenceNumber + '</strong></p>' +
+            '<p>Items: ' + lineItems.map(li => li.variety + ' × ' + li.qty).join(', ') + '</p>' +
+            '<p>Mode: ' + fulfillment + ' on ' + dateStr + ' ' + timeStr + (deliveryWindow ? ' ('+deliveryWindow+')' : '') + '</p>' +
+            '<p><strong>Total:</strong> ' + fmt(total) + ' | <strong>Paid:</strong> ' + fmt(paid) + ' | <strong>Balance:</strong> ' + fmt(balanceDue) + '</p>' +
+            (etransferId ? '<p>e-Transfer ID: ' + etransferId + '</p>' : '') +
+            '<hr style="border:none;border-top:1px solid #ddd;margin:16px 0"/>' +
+            '<h3>Customer Copy</h3>' +
+            '<p>Hi ' + name + ', thank you for your booking. Your invoice <strong>' + invoiceNumber + '</strong> is attached.</p>' +
+            '</div>',
+          attachments: receiptAttachmentBlob ? [pdfAttachment, receiptAttachmentBlob] : [pdfAttachment] }
+      );
+    } else {
+      // Customer email (if provided)
+      if (email) {
+        GmailApp.sendEmail(
+          email,
+          'Your ' + BUSINESS_NAME + ' booking – ' + subjectBase,
+          'Please view this email in HTML; your invoice is attached.',
+          { htmlBody: emailBodyCustomer(name, invoiceNumber, total, paid, balanceDue),
+            attachments: [pdfAttachment] }
+        );
+      }
+      // Owner email
+      if (OWNER_EMAIL) {
+        GmailApp.sendEmail(
+          OWNER_EMAIL,
+          'New Mango Booking: ' + subjectBase,
+          'Please view this email in HTML; invoice attached.',
+          { htmlBody: emailBodyOwner({
+              invoiceNumber: invoiceNumber, name: name, email: email, phone: phone,
+              fulfillment: fulfillment, date: dateStr, time: timeStr, deliveryWindow: deliveryWindow,
+      isDelivery: isDelivery,
+      deliveryStreet: deliveryStreet, deliveryUnit: deliveryUnit, deliveryCity: deliveryCity, deliveryPostal: deliveryPostal, deliveryBuzzer: deliveryBuzzer,
+              total: total, paid: paid, balanceDue: balanceDue, etransferId: etransferId,
+              lineItems: lineItems
+            }),
+            attachments: receiptAttachmentBlob ? [pdfAttachment, receiptAttachmentBlob] : [pdfAttachment] }
+        );
+      }
+    }
+
+        // --- Client confirmation cache (for cross-origin thank-you page) ---
+    try{
+      const reqId = String(fields.requestId || fields.clientRequestId || '').trim();
+      if (reqId) CacheService.getScriptCache().put('confirm_'+reqId, '1', 600);
+    } catch(_e){}
+
+return respond_({ ok:true, invoiceNumber: invoiceNumber, referenceNumber: referenceNumber, baseName: baseName, eventId: event.getId(), receiptUrl: receiptUrl });
+
+  } catch (err){
+    console.error(err);
+    return respond_({ ok:false, error:String(err) });
+  }
+}
+
+// ---------- Helpers ----------
+function json_(o){
+  var out = ContentService.createTextOutput(JSON.stringify(o))
+    .setMimeType(ContentService.MimeType.JSON);
+  // Allow cross-origin reads from your website (GitHub Pages/GoDaddy)
+  try{
+    out.setHeader('Access-Control-Allow-Origin','*');
+    out.setHeader('Access-Control-Allow-Methods','GET,POST,OPTIONS');
+    out.setHeader('Access-Control-Allow-Headers','Content-Type');
+  } catch(_e){}
+  return out;
+
+function jsCallback_(cb, obj){
+  cb = String(cb || '').trim().replace(/[^\w\.$]/g,'');
+  if (!cb) return json_(obj);
+  return ContentService.createTextOutput(cb + '(' + JSON.stringify(obj) + ');')
+    .setMimeType(ContentService.MimeType.JAVASCRIPT);
+}
+
+}
+
+/**
+ * HTML response that posts a message back to the parent page.
+ * This avoids CORS issues when submitting from GitHub Pages/GoDaddy via a hidden iframe.
+ */
+function respond_(payload){
+  const safeJson = JSON.stringify(payload).replace(/</g, '\u003c');
+  const html =
+    '<!doctype html><html><head><meta charset="utf-8"></head><body>' +
+    '<script>(function(){try{var p=' + safeJson + ';' +
+      'if(window.parent){window.parent.postMessage(p,"*");window.parent.postMessage(JSON.stringify(p),"*");}' +
+    '}catch(e){}})();</' + 'script>' +
+    '</body></html>';
+  return HtmlService.createHtmlOutput(html)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+
+function makeDateFromLocal(dateStr, timeStr){
+  const p = dateStr ? dateStr.split('-').map(Number) : [1970,1,1];
+  const t = timeStr ? timeStr.split(':').map(Number) : [0,0];
+  return new Date(p[0], p[1]-1, p[2], t[0]||0, t[1]||0, 0);
+}
+function fmt(n){ return '$' + (Number(n||0)).toFixed(2); }
+function round2(v){ return Math.round((Number(v)||0)*100)/100; }
+function getDriveParentFolder(){ return DRIVE_FOLDER_ID ? DriveApp.getFolderById(DRIVE_FOLDER_ID) : DriveApp.getRootFolder(); }
+function getOrCreateSubfolder(parent, name){
+  const it = parent.getFoldersByName(name);
+  if (it.hasNext()) return it.next();
+  return parent.createFolder(name);
+}
+
+/** Rasterize any blob (images OK; PDFs: try getAs PNG). */
+function rasterizeToPngDataUrl(blob, mimeHint){
+  try {
+    const png = blob.getAs('image/png'); // images, some PDFs (single-page/simple) convert
+    const b64 = Utilities.base64Encode(png.getBytes());
+    return 'data:image/png;base64,' + b64;
+  } catch (e) {
+    if (mimeHint && mimeHint.indexOf('image/') === 0){
+      const b64img = Utilities.base64Encode(blob.getBytes());
+      return 'data:' + mimeHint + ';base64,' + b64img;
+    }
+    return '';
+  }
+}
+
+/** For PDFs: try Advanced Drive API thumbnail → fetch → data URL. Requires enabling Drive API in Services. */
+function tryPdfThumbnailDataUrl_(fileId){
+  try{
+    // Advanced Drive service must be enabled (Services > Drive API)
+    const meta = Drive.Files.get(fileId, { fields: 'thumbnailLink' });
+    if (!meta || !meta.thumbnailLink) return '';
+    // Upsize thumbnail if possible
+    let url = meta.thumbnailLink; // often ends with "=s220"
+    url = url.replace(/=s\d+$/, '=s800');
+    const resp = UrlFetchApp.fetch(url);
+    const bytes = resp.getContent();
+    const b64 = Utilities.base64Encode(bytes);
+    return 'data:image/png;base64,' + b64;
+  }catch(e){
+    // If not enabled or not available, silently skip
+    return '';
+  }
+}
+
+function guessExtFromMime(m){
+  if (!m) return '';
+  if (m === 'image/jpeg') return 'jpg';
+  if (m === 'image/png')  return 'png';
+  if (m === 'image/gif')  return 'gif';
+  if (m === 'image/webp') return 'webp';
+  if (m === 'application/pdf') return 'pdf';
+  if (m.indexOf('image/') === 0) return m.split('/')[1];
+  return '';
+}
+function fileExt(fn){ const m = String(fn||'').match(/\.([A-Za-z0-9]+)$/); return m ? m[1].toLowerCase() : ''; }
+
+// === Friendly names ===
+// "<Name>'s order for 13th November 2025"
+
+// Convert a start time like '09:00' to the booking window label used in the form
+function timeStartToWindow_(hhmm){
+  const t = String(hhmm || '').trim();
+  if (t.startsWith('09')) return '9:00 AM – 12:00 PM';
+  if (t.startsWith('12')) return '12:00 PM – 3:00 PM';
+  if (t.startsWith('15')) return '3:00 PM – 6:00 PM';
+  if (t.startsWith('18')) return '6:00 PM – 8:00 PM';
+  return '';
+}
+
+
+function windowLabelToStart24h_(label){
+  const s = String(label || '').trim();
+  if (!s) return '';
+  // Extract first time like "9:00 AM" from "9:00 AM – 12:00 PM"
+  const m = s.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/i);
+  if (!m) return '';
+  let hh = parseInt(m[1],10);
+  const mm = parseInt(m[2] || '00',10);
+  const ap = (m[3] || '').toUpperCase();
+  if (ap === 'PM' && hh !== 12) hh += 12;
+  if (ap === 'AM' && hh === 12) hh = 0;
+  return String(hh).padStart(2,'0') + ':' + String(mm).padStart(2,'0');
+}
+
+function makeBaseNameForDate(customerName, dateObj, fulfillment){
+  const nm = (customerName || 'Customer').trim();
+  const poss = nm.slice(-1).toLowerCase() === 's' ? nm + '\'' : nm + '\'s';
+  const mode = (fulfillment || '').trim();
+  const modeLabel = mode ? (mode + ' ') : '';
+  // "<Name>'s Pickup order for 13th November 2025"
+  return poss + ' ' + modeLabel.toLowerCase() + 'order for ' + prettyDate(dateObj);
+}
+function prettyDate(d){
+  const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const dd = d.getDate();
+  return ordinal(dd) + ' ' + months[d.getMonth()] + ' ' + d.getFullYear();
+}
+function ordinal(n){
+  const s = ['th','st','nd','rd'], v = n%100;
+  return n + (s[(v-20)%10] || s[v] || s[0]);
+}
+
+/** parse form (multipart/urlencoded) preserving arrays, files & order */
+function parseForm(e){
+  if (e.postData && e.postData.type && e.postData.type.indexOf('multipart/form-data') !== -1) {
+    const parts = Utilities.parseMultipart(e.postData.contents, e.postData.type);
+    const out = {_files:{}, _arrays:{}, _order:[]};
+    parts.forEach(p=>{
+      out._order.push({ name:p.name, isFile:!!p.fileName, contents:p.contents, blob:p.blob });
+      if (p.fileName) {
+        out._files[p.name] = p.blob;
+      } else {
+        if (p.name && p.name.slice(-2) === '[]') {
+          if (!out._arrays[p.name]) out._arrays[p.name] = [];
+          out._arrays[p.name].push(p.contents);
+        } else {
+          if (out[p.name] === undefined) {
+            out[p.name] = p.contents;
+          } else {
+            if (!out._arrays[p.name]) out._arrays[p.name] = [];
+            out._arrays[p.name].push(out[p.name]);
+            out._arrays[p.name].push(p.contents);
+            delete out[p.name];
+          }
+        }
+      }
+    });
+    return out;
+  }
+  return Object.assign({}, e.parameter, { _arrays:(e.parameters||{}), _files:{}, _order:[] });
+}
+
+function getArray(fields, key){
+  if (fields._arrays && fields._arrays[key]) return fields._arrays[key];
+  const alt = key.replace('[]','');
+  if (fields._arrays && fields._arrays[alt]) return fields._arrays[alt];
+  if (fields[key] != null) return [fields[key]];
+  if (fields[alt] != null) return [fields[alt]];
+  return [];
+}
+
+function buildLineItemsFromFields(fields, prices){
+  const items = [];
+  const occ = [];
+  (fields._order || []).forEach(e=>{
+    if (e.isFile) return;
+    if (e.name === 'itemVariety[]' || e.name === 'itemVariety') occ.push({k:'v', val:e.contents});
+    if (e.name === 'itemQty[]'     || e.name === 'itemQty')     occ.push({k:'q', val:e.contents});
+  });
+  if (occ.length === 0){
+    const vs = getArray(fields,'itemVariety[]');
+    const qs = getArray(fields,'itemQty[]');
+    const maxLen = Math.max(vs.length,qs.length);
+    for (let i=0;i<maxLen;i++){ occ.push({k:'v',val:vs[i]}); occ.push({k:'q',val:qs[i]}); }
+  }
+  let pending = null;
+  occ.forEach(o=>{
+    if (o.k === 'v'){
+      const v = String(o.val||'').trim();
+      // Ignore placeholder options like "Select..."
+      if (!v || /^select/i.test(v) || v === '-' || v === '--') {
+        pending = null;
+      } else {
+        pending = v;
+      }
+    } else if (o.k === 'q' && pending){
+      const q = parseInt(o.val||'0',10)||0;
+      if (q>0){
+        const unit = Number(prices[pending]||0);
+        const line = round2(unit*q);
+        items.push({ variety:pending, qty:q, unit, line });
+      }
+      pending = null;
+    }
+  });
+  return items;
+}
+
+// ---------- Invoice HTML (BUSINESS_NAME as title; no file name inside) ----------
+function buildInvoiceHtml(d){
+  const currency = v => '$' + Number(v || 0).toFixed(2);
+  const esc = s => String(s || '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c] || c));
+  const when = d.isDelivery
+    ? (d.date + (d.deliveryWindow ? ' ' + d.deliveryWindow : (d.time ? ' ' + d.time : '')))
+    : (d.date + ' ' + d.time);
+
+  const deliveryAddressBlock = (d.isDelivery && (d.deliveryStreet || d.deliveryCity || d.deliveryPostal))
+    ? ('<div class="box"><strong>Delivery Address:</strong><br/>' +
+        esc(d.deliveryStreet || '') +
+        (d.deliveryUnit ? ('<br/>Unit: ' + esc(d.deliveryUnit)) : '') +
+        '<br/>' + esc((d.deliveryCity || '') + (d.deliveryPostal ? (' ' + d.deliveryPostal) : '')) +
+        (d.deliveryBuzzer ? ('<br/>Buzzer: ' + esc(d.deliveryBuzzer)) : '') +
+      '</div>')
+    : '';
+
+  const rows = d.lineItems.map(li =>
+    '<tr><td>' + li.variety + ' × ' + li.qty + '</td><td class="right">' + currency(li.unit) + '</td><td class="right">' + currency(li.line) + '</td></tr>'
+  ).join('');
+
+  const receiptBlock = d.receiptEmbedDataUrl
+    ? '<div class="box"><strong>Payment receipt:</strong><br/><img src="' + d.receiptEmbedDataUrl + '" style="max-width:320px;border:1px solid #ddd;border-radius:6px"/></div>'
+    : (d.receiptUrl ? '<div class="box"><strong>Payment receipt (link):</strong> <a href="' + d.receiptUrl + '">View file</a></div>' : '');
+
+  return (
+  '<html><head><meta charset="utf-8"><style>' +
+  'body{font-family:Arial,Helvetica,sans-serif;margin:0;padding:24px;color:#111}' +
+  '.head{display:flex;justify-content:space-between;align-items:start;margin-bottom:16px}' +
+  'h1{margin:0 0 6px;font-size:22px}.muted{color:#666}' +
+  'table{width:100%;border-collapse:collapse;margin-top:12px}' +
+  'td,th{padding:8px 0;border-bottom:1px solid #eee;vertical-align:top}' +
+  'th{text-align:left}.right{text-align:right}' +
+  '.box{padding:10px 12px;background:#f7f9fc;border:1px solid #e6ecf5;border-radius:8px;margin-top:12px}' +
+  '</style></head><body>' +
+
+  '<div class="head"><div>' +
+  '<h1>' + d.businessName + '</h1>' +                        // company name as the first line
+  '<div class="muted">Invoice #: ' + d.invoiceNumber + '</div>' +
+  (d.referenceNumber ? ('<div class="muted">Reference #: ' + d.referenceNumber + '</div>') : '') +
+  '</div><div class="right">' +
+  '<div><strong>Customer</strong></div>' +
+  '<div>' + d.name + '</div>' +
+  '<div>' + d.email + '</div>' +
+  '<div>' + d.phone + '</div>' +
+  '</div></div>' +
+
+  '<div class="box"><strong>Booking:</strong> ' + d.fulfillment + ' on ' + when + '</div>' +
+
+  deliveryAddressBlock +
+
+  '<table><thead><tr><th>Item</th><th class="right">Price/Box</th><th class="right">Subtotal</th></tr></thead>' +
+  '<tbody>' + rows + '</tbody>' +
+  '<tr><td colspan="2"><strong>Subtotal (boxes)</strong></td><td class="right"><strong>' + currency(d.subtotalBoxes) + '</strong></td></tr>' +
+  '<tr><td colspan="2">Delivery Fee</td><td class="right">' + currency(d.deliveryFee) + '</td></tr>' +
+  '<tr><td colspan="2">Advance Discount</td><td class="right">- ' + currency(d.advanceDiscount) + '</td></tr>' +
+  '<tr><td colspan="2"><strong>Total</strong></td><td class="right"><strong>' + currency(d.total) + '</strong></td></tr>' +
+  '<tr><td colspan="2">Amount Paid</td><td class="right">' + currency(d.paid) + '</td></tr>' +
+  '<tr><td colspan="2"><strong>Balance Due</strong></td><td class="right"><strong>' + currency(d.balanceDue) + '</strong></td></tr>' +
+  '</table>' +
+
+  '<div class="box"><strong>Payment details:</strong><br/>' +
+  (d.advancePayment === 'Yes' ? 'Advance payment chosen (discount applied).' : 'Pay at pickup/delivery.') + '<br/>' +
+  (d.etransferId ? ('e-Transfer ID: ' + d.etransferId + '<br/>') : '') +
+  (d.paymentDate ? ('Payment date: ' + d.paymentDate + (d.paymentTime ? (' ' + d.paymentTime) : '') + '<br/>') : '') +
+  '</div>' +
+
+  receiptBlock +
+  '</body></html>'
+  );
+}
+
+// ---------- Email Bodies (no Drive links; 1 attachment only) ----------
+function emailBodyCustomer(name, invoiceNumber, total, paid, balanceDue){
+  const currency = v => '$' + Number(v || 0).toFixed(2);
+  const esc = s => String(s || '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c] || c));
+  return (
+    '<div style="font-family:Arial,Helvetica,sans-serif;color:#111">' +
+    '<h2>Thank you, ' + name + '!</h2>' +
+    '<p>Your mango booking is confirmed. Your invoice <strong>' + invoiceNumber + '</strong> is attached as a PDF.</p>' +
+    '<p><strong>Total:</strong> ' + currency(total) + '<br/>' +
+    '<strong>Paid:</strong> ' + currency(paid) + '<br/>' +
+    '<strong>Balance due:</strong> ' + currency(balanceDue) + '</p>' +
+    '<p>— ' + BUSINESS_NAME + '</p></div>'
+  );
+}
+
+function emailBodyOwner(d){
+  const currency = v => '$' + Number(v || 0).toFixed(2);
+  const esc = s => String(s || '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c] || c));
+  return (
+    '<div style="font-family:Arial,Helvetica,sans-serif;color:#111">' +
+    '<h2>New Mango Booking</h2>' +
+    '<p><strong>' + d.name + '</strong> (' + (d.email||'no-email') + ', ' + d.phone + ')</p>' +
+    '<p>Invoice: <strong>' + d.invoiceNumber + '</strong></p>' +
+    '<p>Items: ' + d.lineItems.map(li => li.variety + ' × ' + li.qty).join(', ') + '</p>' +
+    '<p>Mode: ' + d.fulfillment + ' on ' + d.date + ' ' + d.time + (d.deliveryWindow ? ' ('+d.deliveryWindow+')' : '') + '</p>' +
+    '<p><strong>Total:</strong> ' + currency(d.total) + ' | <strong>Paid:</strong> ' + currency(d.paid) + ' | <strong>Balance:</strong> ' + currency(d.balanceDue) + '</p>' +
+    (d.etransferId ? '<p>e-Transfer ID: ' + d.etransferId + '</p>' : '') +
+    '</div>'
+  );
+}
+
+
+// ==============================
+// Admin Console + Live Config API
+// ==============================
+
+function api_handlePostAction_(action, e){
+  const body = parseJsonBody_(e);
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+
+  switch(action){
+    case 'updateStatus': {
+      const ref = String((body.referenceNumber || body.ref || '').trim());
+      const status = String((body.status || '').trim() || 'Done');
+      if (!ref) throw new Error('Missing referenceNumber');
+      api_setStatusByRef_(ss, ref, status);
+      return { ok:true, referenceNumber: ref, status: status };
+    }
+
+    case 'saveVarieties': {
+      const varieties = Array.isArray(body.varieties) ? body.varieties : [];
+      api_saveVarieties_(ss, varieties);
+      return { ok:true };
+    }
+
+    case 'saveDates': {
+      api_saveDates_(ss, body);
+      return { ok:true };
+    }
+
+    case 'saveSlots': {
+      api_saveSlots_(ss, body);
+      return { ok:true };
+    }
+
+    case 'updateBooking': {
+      const ref = String((body.referenceNumber || '').trim());
+      const token = String((body.token || '').trim()); // token is phone or email for basic verification
+      if (!ref || !token) throw new Error('Missing referenceNumber or token');
+      const result = api_updateBooking_(ss, ref, token, body);
+      return Object.assign({ ok:true }, result);
+    }
+
+    default:
+      throw new Error('Unknown POST action: ' + action);
+  }
+}
+
+function api_getConfig_(){
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  ensureConfigSheets_(ss);
+
+  const varieties = readConfigVarieties_(ss);
+
+  // Preferred: per-date availability (Config_Availability)
+  const availability = readConfigAvailability_(ss);
+
+  // Backward-compatible: legacy dates + slots
+  let dates = readConfigDates_(ss);
+  const slots = readConfigSlots_(ss);
+
+  // If availability exists, derive dates for convenience
+  if (availability && (Object.keys(availability.pickup || {}).length || Object.keys(availability.delivery || {}).length)){
+    dates = {
+      pickup: Object.keys(availability.pickup || {}).sort(),
+      delivery: Object.keys(availability.delivery || {}).sort()
+    };
+  }
+
+  return { ok:true, varieties: varieties, dates: dates, slots: slots, availability: availability };
+}
+
+function api_listOrders_(p){
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  // Ensure headers exist (adds new columns if missing)
+  ensureBookingsHeaders_(ss);
+  ensureDeliveryHeaders_(ss);
+
+  const q = String(p.q || '').trim().toLowerCase();
+  const type = String(p.type || '').trim(); // Pickup / Delivery / (blank=all)
+  const statusFilter = String(p.status || '').trim(); // Pending / Done / (blank=all)
+
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return { ok:true, orders: [] };
+
+  const head = values[0].map(String);
+  const col = indexMap_(head);
+
+  const orders = [];
+  for (let r=1; r<values.length; r++){
+    const row = values[r];
+    const fulfillment = (row[col.fulfillment] || '').toString();
+    if (type && fulfillment !== type) continue;
+
+    const status = (row[col.status] || 'Pending').toString();
+    if (statusFilter && status !== statusFilter) continue;
+
+    const ref = (row[col.reference] || '').toString().trim();
+    const invoiceNumber = (row[col.invoice] || '').toString().trim();
+    const name = (row[col.name] || '').toString();
+    const phone = (row[col.phone] || '').toString();
+    const email = (row[col.email] || '').toString();
+    const date = (row[col.date] || '').toString();
+    const time = (row[col.time] || '').toString();
+    const deliveryWindow = (row[col.deliveryWindow] || '').toString();
+    const city = (row[col.deliveryCity] || '').toString();
+
+    const totalQty = Number(row[col.totalQty] || 0);
+    const total = Number(row[col.total] || 0);
+
+    const hay = (ref + ' ' + invoiceNumber + ' ' + name + ' ' + phone + ' ' + email + ' ' + city).toLowerCase();
+    if (q && !hay.includes(q)) continue;
+
+    const start24h = fulfillment === 'Delivery'
+      ? (windowLabelToStart24h_(deliveryWindow) || time || '')
+      : (time || '');
+
+    orders.push({
+      referenceNumber: ref,
+      invoiceNumber: invoiceNumber,
+      status: status,
+      fulfillment: fulfillment,
+      date: date,
+      time: time,
+      deliveryWindow: deliveryWindow,
+      city: city,
+      name: name,
+      phone: phone,
+      email: email,
+      totalQty: totalQty,
+      total: total,
+      start24h: start24h
+    });
+  }
+
+  orders.sort((a,b) => {
+    if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+    if (a.start24h !== b.start24h) return a.start24h < b.start24h ? -1 : 1;
+    if ((a.city||'') !== (b.city||'')) return (a.city||'') < (b.city||'') ? -1 : 1;
+    return String(a.referenceNumber||'').localeCompare(String(b.referenceNumber||''));
+  });
+
+  return { ok:true, orders: orders };
+}
+
+function api_getBooking_(p){
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  ensureBookingsHeaders_(ss);
+
+  const ref = String(p.referenceNumber || p.ref || '').trim();
+  const token = String(p.token || '').trim(); // phone or email
+  if (!ref || !token) return { ok:false, error:'Missing referenceNumber or token' };
+
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return { ok:false, error:'No bookings found' };
+
+  const head = values[0].map(String);
+  const col = indexMap_(head);
+
+  for (let r=1; r<values.length; r++){
+    const row = values[r];
+    const rref = String(row[col.reference] || '').trim();
+    if (rref !== ref) continue;
+
+    const phone = String(row[col.phone] || '').trim();
+    const email = String(row[col.email] || '').trim();
+    const okToken = (token === phone) || (token.toLowerCase() === email.toLowerCase());
+    if (!okToken) return { ok:false, error:'Verification failed (token must match phone or email on booking)' };
+
+    return {
+      ok:true,
+      booking: {
+        referenceNumber: rref,
+        invoiceNumber: String(row[col.invoice] || ''),
+        status: String(row[col.status] || 'Pending'),
+        name: String(row[col.name] || ''),
+        email: email,
+        phone: phone,
+        fulfillment: String(row[col.fulfillment] || ''),
+        date: String(row[col.date] || ''),
+        time: String(row[col.time] || ''),
+        deliveryWindow: String(row[col.deliveryWindow] || ''),
+        deliveryStreet: String(row[col.deliveryStreet] || ''),
+        deliveryUnit: String(row[col.deliveryUnit] || ''),
+        deliveryCity: String(row[col.deliveryCity] || ''),
+        deliveryPostal: String(row[col.deliveryPostal] || ''),
+        deliveryBuzzer: String(row[col.deliveryBuzzer] || ''),
+        notes: String(row[col.notes] || '')
+      }
+    };
+  }
+  return { ok:false, error:'Reference not found' };
+}
+
+function api_updateBooking_(ss, referenceNumber, token, patch){
+  ensureBookingsHeaders_(ss);
+  ensureDeliveryHeaders_(ss);
+
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  const values = sheet.getDataRange().getValues();
+  const head = values[0].map(String);
+  const col = indexMap_(head);
+
+  for (let r=1; r<values.length; r++){
+    const row = values[r];
+    const ref = String(row[col.reference] || '').trim();
+    if (ref !== referenceNumber) continue;
+
+    const phone = String(row[col.phone] || '').trim();
+    const email = String(row[col.email] || '').trim();
+    const okToken = (token === phone) || (token.toLowerCase() === email.toLowerCase());
+    if (!okToken) throw new Error('Verification failed');
+
+    // Allowed updates
+    const updates = [];
+    const setCell = (colIdx, value) => updates.push({ col: colIdx+1, val: value });
+
+    if (typeof patch.date === 'string') setCell(col.date, patch.date);
+    if (typeof patch.time === 'string') setCell(col.time, patch.time);
+    if (typeof patch.deliveryWindow === 'string') setCell(col.deliveryWindow, patch.deliveryWindow);
+
+    if (typeof patch.deliveryStreet === 'string') setCell(col.deliveryStreet, patch.deliveryStreet);
+    if (typeof patch.deliveryUnit === 'string') setCell(col.deliveryUnit, patch.deliveryUnit);
+    if (typeof patch.deliveryCity === 'string') setCell(col.deliveryCity, patch.deliveryCity);
+    if (typeof patch.deliveryPostal === 'string') setCell(col.deliveryPostal, patch.deliveryPostal);
+    if (typeof patch.deliveryBuzzer === 'string') setCell(col.deliveryBuzzer, patch.deliveryBuzzer);
+
+    if (typeof patch.notes === 'string') setCell(col.notes, patch.notes);
+
+    setCell(col.updatedAt, new Date());
+
+    // Apply updates
+    updates.forEach(u => sheet.getRange(r+1, u.col).setValue(u.val));
+
+    // If it's a Delivery booking, also sync Delivery Orders sheet row by reference
+    const fulfillment = String(row[col.fulfillment] || '').trim();
+    if (fulfillment === 'Delivery'){
+      const dSheet = ss.getSheetByName(DELIVERY_SHEET_NAME);
+      if (dSheet && dSheet.getLastRow() > 1){
+        const dVals = dSheet.getDataRange().getValues();
+        const dHead = dVals[0].map(String);
+        const dCol = indexMapDelivery_(dHead);
+        for (let dr=1; dr<dVals.length; dr++){
+          const dRef = String(dVals[dr][dCol.reference] || '').trim();
+          if (dRef !== referenceNumber) continue;
+          // Update mapped fields
+          if (typeof patch.date === 'string') dSheet.getRange(dr+1, dCol.date+1).setValue(patch.date);
+          if (typeof patch.deliveryWindow === 'string') dSheet.getRange(dr+1, dCol.window+1).setValue(patch.deliveryWindow);
+          if (typeof patch.deliveryStreet === 'string') dSheet.getRange(dr+1, dCol.street+1).setValue(patch.deliveryStreet);
+          if (typeof patch.deliveryUnit === 'string') dSheet.getRange(dr+1, dCol.unit+1).setValue(patch.deliveryUnit);
+          if (typeof patch.deliveryCity === 'string') dSheet.getRange(dr+1, dCol.city+1).setValue(patch.deliveryCity);
+          if (typeof patch.deliveryPostal === 'string') dSheet.getRange(dr+1, dCol.postal+1).setValue(patch.deliveryPostal);
+          if (typeof patch.deliveryBuzzer === 'string') dSheet.getRange(dr+1, dCol.buzzer+1).setValue(patch.deliveryBuzzer);
+          // Update start24h column for correct sorting
+          const start24h = windowLabelToStart24h_(patch.deliveryWindow || dVals[dr][dCol.window] || '') || '';
+          dSheet.getRange(dr+1, dCol.start24h+1).setValue(start24h);
+
+          // Resort delivery sheet (keep header)
+          const lastRow = dSheet.getLastRow();
+          const headersLen = dHead.length;
+          if (lastRow > 2){
+            const range = dSheet.getRange(2,1,lastRow-1,headersLen);
+            range.sort([{column:1,ascending:true},{column:headersLen,ascending:true},{column:dCol.city+1,ascending:true}]);
+          }
+          break;
+        }
+      }
+    }
+
+    return { referenceNumber: referenceNumber };
+  }
+
+  throw new Error('Reference not found');
+}
+
+function api_setStatusByRef_(ss, referenceNumber, status){
+  ensureBookingsHeaders_(ss);
+  ensureDeliveryHeaders_(ss);
+
+  // Update Bookings
+  const bSheet = ss.getSheetByName(SHEET_NAME);
+  const bVals = bSheet.getDataRange().getValues();
+  const bHead = bVals[0].map(String);
+  const bCol = indexMap_(bHead);
+
+  for (let r=1; r<bVals.length; r++){
+    const ref = String(bVals[r][bCol.reference] || '').trim();
+    if (ref !== referenceNumber) continue;
+    bSheet.getRange(r+1, bCol.status+1).setValue(status);
+    bSheet.getRange(r+1, bCol.updatedAt+1).setValue(new Date());
+    break;
+  }
+
+  // Update Delivery Orders (if present)
+  const dSheet = ss.getSheetByName(DELIVERY_SHEET_NAME);
+  if (dSheet && dSheet.getLastRow() > 1){
+    const dVals = dSheet.getDataRange().getValues();
+    const dHead = dVals[0].map(String);
+    const dCol = indexMapDelivery_(dHead);
+    for (let r=1; r<dVals.length; r++){
+      const ref = String(dVals[r][dCol.reference] || '').trim();
+      if (ref !== referenceNumber) continue;
+      dSheet.getRange(r+1, dCol.status+1).setValue(status);
+      break;
+    }
+  }
+}
+
+function ensureBookingsHeaders_(ss){
+  const headers = [
+    'Timestamp','Invoice #','Name','Email','Phone',
+    'Fulfillment','Date','Time','Delivery Window',
+    'Advance Payment','Advance Discount','Total Qty',
+    'Line Items JSON','Subtotal Boxes','Delivery Fee','Tax','Total','Paid','Balance Due',
+    'eTransfer ID','Payment Date','Payment Time','Notes','Receipt URL','Event ID',
+    'Reference #','Status','Delivery Street','Delivery Unit','Delivery City','Delivery Postal','Delivery Buzzer','Updated At'
+  ];
+  getOrCreateSheet_(ss, SHEET_NAME, headers);
+}
+
+function ensureDeliveryHeaders_(ss){
+  // IMPORTANT: Do NOT touch or rewrite headers in Delivery Orders.
+  // This function is kept only for backward compatibility with existing calls.
+  // If the sheet does not exist, it will be created BLANK (no headers written).
+  var sh = ss.getSheetByName(DELIVERY_SHEET_NAME);
+  if (!sh){
+    sh = ss.insertSheet(DELIVERY_SHEET_NAME);
+  }
+  return sh;
+}
+
+
+function indexMap_(head){
+  // Booking sheet indexes (0-based)
+  const idx = {};
+  idx.timestamp = head.indexOf('Timestamp');
+  idx.invoice = head.indexOf('Invoice #');
+  idx.name = head.indexOf('Name');
+  idx.email = head.indexOf('Email');
+  idx.phone = head.indexOf('Phone');
+  idx.fulfillment = head.indexOf('Fulfillment');
+  idx.date = head.indexOf('Date');
+  idx.time = head.indexOf('Time');
+  idx.deliveryWindow = head.indexOf('Delivery Window');
+  idx.totalQty = head.indexOf('Total Qty');
+  idx.total = head.indexOf('Total');
+  idx.notes = head.indexOf('Notes');
+  idx.reference = head.indexOf('Reference #');
+  idx.status = head.indexOf('Status');
+  idx.deliveryStreet = head.indexOf('Delivery Street');
+  idx.deliveryUnit = head.indexOf('Delivery Unit');
+  idx.deliveryCity = head.indexOf('Delivery City');
+  idx.deliveryPostal = head.indexOf('Delivery Postal');
+  idx.deliveryBuzzer = head.indexOf('Delivery Buzzer');
+  idx.updatedAt = head.indexOf('Updated At');
+
+  // Fallbacks for old sheets
+  Object.keys(idx).forEach(k => { if (idx[k] < 0) idx[k] = head.length; });
+
+  return idx;
+}
+
+function indexMapDelivery_(head){
+  // Delivery sheet indexes (0-based)
+  const idx = {};
+  idx.date = head.indexOf('Delivery Date');
+  idx.window = head.indexOf('Delivery Time Window');
+  idx.street = head.indexOf('Street Name & Number');
+  idx.unit = head.indexOf('Suite Number');
+  idx.city = head.indexOf('City');
+  idx.postal = head.indexOf('Postal Code');
+  idx.buzzer = head.indexOf('Buzzer Code');
+  idx.invoice = head.indexOf('Invoice #');
+  idx.reference = head.indexOf('Reference #');
+  idx.status = head.indexOf('Status');
+  idx.start24h = head.indexOf('Delivery Start (24h)');
+  return idx;
+}
+
+function parseJsonBody_(e){
+  try{
+    if (!e || !e.postData || !e.postData.contents) return {};
+    const c = e.postData.contents;
+    return JSON.parse(c);
+  } catch(err){
+    return {};
+  }
+}
+
+function generateShortRef_(ss, sheetName, headerName){
+  // 4-digit ref, tries to avoid collisions
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet || sheet.getLastRow() < 2) return String(Math.floor(1000 + Math.random()*9000));
+  const values = sheet.getDataRange().getValues();
+  const head = values[0].map(String);
+  const col = head.indexOf(headerName);
+  const used = new Set();
+  if (col >= 0){
+    for (let r=1; r<values.length; r++){
+      const v = String(values[r][col] || '').trim();
+      if (v) used.add(v);
+    }
+  }
+  for (let i=0;i<30;i++){
+    const cand = String(Math.floor(1000 + Math.random()*9000));
+    if (!used.has(cand)) return cand;
+  }
+  return String(Math.floor(1000 + Math.random()*9000));
+}
+
+// ---------- Config Sheets ----------
+function ensureConfigSheets_(ss){
+  // Varieties
+  const vHead = ['Variety','Price','Active'];
+  const v = getOrCreateSheet_(ss, 'Config_Varieties', vHead);
+  if (v.getLastRow() < 2){
+    v.appendRow(['Alphonso',50,true]);
+    v.appendRow(['Kesar',40,true]);
+    v.appendRow(['Badami',35,true]);
+    v.appendRow(['Langra',30,false]);
+    v.appendRow(['Dasheri',20,false]);
+  }
+
+  // Slots
+  const sHead = ['Mode','Start (24h)','Label','Active'];
+  const s = getOrCreateSheet_(ss, 'Config_Slots', sHead);
+  if (s.getLastRow() < 2){
+    // Pickup slots (example)
+    s.appendRow(['Pickup','10:00','10:00 AM', true]);
+    s.appendRow(['Pickup','12:00','12:00 PM', true]);
+    s.appendRow(['Pickup','14:00','2:00 PM', true]);
+    // Delivery windows (example)
+    s.appendRow(['Delivery','09:00','9:00 AM – 12:00 PM', true]);
+    s.appendRow(['Delivery','12:00','12:00 PM – 3:00 PM', true]);
+    s.appendRow(['Delivery','15:00','3:00 PM – 6:00 PM', true]);
+    s.appendRow(['Delivery','18:00','6:00 PM – 8:00 PM', true]);
+  }
+
+  // Dates
+  const dHead = ['Mode','Date (YYYY-MM-DD)','Active'];
+  const d = getOrCreateSheet_(ss, 'Config_Dates', dHead);
+  if (d.getLastRow() < 2){
+    const tz = Session.getScriptTimeZone();
+    const today = new Date();
+    for (let i=2;i<=30;i+=7){
+      const dt = new Date(today.getTime());
+      dt.setDate(dt.getDate()+i);
+      const s = Utilities.formatDate(dt, tz, 'yyyy-MM-dd');
+      d.appendRow(['Pickup', s, true]);
+      d.appendRow(['Delivery', s, true]);
+    }
+  }
+  // Per-date availability (preferred)
+  // Columns: Mode | Date (YYYY-MM-DD) | Start (24h) | Label | Active
+  const aHead = ['Mode','Date (YYYY-MM-DD)','Start (24h)','Label','Active'];
+  const a = getOrCreateSheet_(ss, 'Config_Availability', aHead);
+  if (a.getLastRow() < 2){
+    // Example rows (edit directly in the sheet anytime)
+    a.appendRow(['Pickup','2025-12-20','12:00','12:00 PM – 3:00 PM', true]);
+    a.appendRow(['Pickup','2025-12-20','16:00','4:00 PM – 6:00 PM', true]);
+    a.appendRow(['Pickup','2025-12-20','20:00','8:00 PM – 9:00 PM', true]);
+    a.appendRow(['Pickup','2025-12-21','07:00','7:00 AM – 9:00 AM', true]);
+    a.appendRow(['Pickup','2025-12-21','16:00','4:00 PM – 5:00 PM', true]);
+    a.appendRow(['Delivery','2025-12-21','13:00','1:00 PM – 3:00 PM', true]);
+  }
+
+}
+
+
+function readConfigVarieties_(ss){
+  const sh = ss.getSheetByName('Config_Varieties');
+  const v = sh.getDataRange().getValues();
+  const out = [];
+  for (let r=1;r<v.length;r++){
+    const name = String(v[r][0]||'').trim();
+    if (!name) continue;
+    out.push({ name: name, price: Number(v[r][1]||0), active: String(v[r][2]).toLowerCase() !== 'false' });
+  }
+  return out;
+}
+
+function readConfigSlots_(ss){
+  const sh = ss.getSheetByName('Config_Slots');
+  if (!sh) return { pickup: [], delivery: [] };
+  const tz = Session.getScriptTimeZone();
+  const v = sh.getDataRange().getValues();
+  const out = { pickup: [], delivery: [] };
+
+  for (let r=1;r<v.length;r++){
+    const modeKey = normalizeModeKey_(v[r][0]);
+    const label = String(v[r][2]||'').trim();
+    const active = String(v[r][3]).toLowerCase() !== 'false';
+    if (!active || !modeKey || !label) continue;
+
+    // Start may be stored as a time, as text, or sometimes embedded in the label.
+    let start = normalizeTimeHHMM_(v[r][1], tz);
+    if (!start) start = normalizeTimeHHMM_(label, tz);
+    if (!start) continue;
+
+    const item = { start: start, label: label };
+    out[modeKey].push(item);
+  }
+
+  // sort by start
+  out.pickup.sort((a,b)=>a.start<b.start?-1:(a.start>b.start?1:0));
+  out.delivery.sort((a,b)=>a.start<b.start?-1:(a.start>b.start?1:0));
+  return out;
+}
+
+
+function readConfigDates_(ss){
+  const sh = ss.getSheetByName('Config_Dates');
+  if (!sh) return { pickup: [], delivery: [] };
+  const tz = Session.getScriptTimeZone();
+  const v = sh.getDataRange().getValues();
+  const out = { pickup: [], delivery: [] };
+
+  for (let r=1;r<v.length;r++){
+    const modeKey = normalizeModeKey_(v[r][0]);
+    const active = String(v[r][2]).toLowerCase() !== 'false';
+    if (!active || !modeKey) continue;
+
+    const dateStr = normalizeDateYYYYMMDD_(v[r][1], tz);
+    if (!dateStr) continue;
+
+    out[modeKey].push(dateStr);
+  }
+
+  out.pickup.sort();
+  out.delivery.sort();
+  return out;
+}
+
+
+
+function readConfigAvailability_(ss){
+  const sh = ss.getSheetByName('Config_Availability');
+  if (!sh) return { pickup:{}, delivery:{} };
+
+  const tz = Session.getScriptTimeZone();
+  const v = sh.getDataRange().getValues();
+  const out = { pickup: {}, delivery: {} };
+
+  for (let r=1;r<v.length;r++){
+    const modeKey = normalizeModeKey_(v[r][0]);
+    const dateStr = normalizeDateYYYYMMDD_(v[r][1], tz);
+    const label = String(v[r][3] || '').trim();
+    const active = String(v[r][4]).toLowerCase() !== 'false';
+    if (!active || !modeKey || !dateStr || !label) continue;
+
+    // Start may be stored as a time, as text, or embedded in the label.
+    let start = normalizeTimeHHMM_(v[r][2], tz);
+    if (!start) start = normalizeTimeHHMM_(label, tz);
+    if (!start) continue;
+
+    if (!out[modeKey][dateStr]) out[modeKey][dateStr] = [];
+    out[modeKey][dateStr].push({ start: start, label: label });
+  }
+
+  ['pickup','delivery'].forEach(k=>{
+    Object.keys(out[k]).forEach(dateStr=>{
+      out[k][dateStr].sort((a,b)=>a.start<b.start?-1:(a.start>b.start?1:0));
+    });
+  });
+
+  return out;
+}
+
+
+function normalizeModeKey_(mode){
+  const m = String(mode || '').trim().toLowerCase();
+  if (!m) return '';
+  if (m === 'pickup' || m === 'pick up' || m === 'pick-up') return 'pickup';
+  if (m === 'delivery' || m === 'deliver') return 'delivery';
+  return '';
+}
+
+function normalizeDateYYYYMMDD_(val, tz){
+  if (val instanceof Date && !isNaN(val.getTime())){
+    return Utilities.formatDate(val, tz, 'yyyy-MM-dd');
+  }
+  const s = String(val || '').trim();
+  if (!s) return '';
+  // accept YYYY-MM-DD or anything starting with it
+  const m = s.match(/(\d{4}-\d{2}-\d{2})/);
+  if (m) return m[1];
+  // try Date parse
+  const d = new Date(s);
+  if (d instanceof Date && !isNaN(d.getTime())){
+    return Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+  }
+  return '';
+}
+
+function normalizeTimeHHMM_(val, tz){
+  // Accept:
+  // - Date objects (time-of-day)
+  // - "HH:MM"
+  // - "H:MM AM/PM"
+  // - ranges like "12:00 PM – 3:00 PM" (we take the first time)
+  // - labels like "12 to 3" (we treat as 12:00)
+  if (val instanceof Date && !isNaN(val.getTime())){
+    return Utilities.formatDate(val, tz || Session.getScriptTimeZone(), 'HH:mm');
+  }
+
+  let s = String(val || '').trim();
+  if (!s) return '';
+
+  // Extract first time-like token from the string
+  // Examples matched:
+  // "12:00", "7:30 AM", "12:00 PM – 3:00 PM", "7 AM – 9 AM"
+  let m = s.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?/i);
+  if (!m) return '';
+
+  let hh = Number(m[1]);
+  let mm = (m[2] !== undefined) ? Number(m[2]) : 0;
+  const ampm = (m[3] || '').toUpperCase();
+
+  if (isNaN(hh) || isNaN(mm)) return '';
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+    // If hour looks like 1-12 with AM/PM we can still handle it; otherwise reject.
+    if (!(hh >= 1 && hh <= 12 && (ampm === 'AM' || ampm === 'PM'))) return '';
+  }
+
+  if (ampm === 'AM' || ampm === 'PM'){
+    // convert to 24h
+    if (hh === 12) hh = (ampm === 'AM') ? 0 : 12;
+    else if (ampm === 'PM') hh += 12;
+  } else {
+    // Handle "12 to 3" style labels: if there is no colon and no AM/PM, keep as HH:00.
+    // Also accept "730" formats (handled below).
+  }
+
+  // Also support compact "HHMM" (e.g., "730" or "0730") if original string starts that way
+  if (!m[2]){
+    const m2 = s.match(/^(\d{1,2})(\d{2})$/);
+    if (m2){
+      hh = Number(m2[1]);
+      mm = Number(m2[2]);
+    }
+  }
+
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return '';
+  return String(hh).padStart(2,'0') + ':' + String(mm).padStart(2,'0');
+}
+
+
+
+
+function api_saveVarieties_(ss, varieties){
+  ensureConfigSheets_(ss);
+  const sh = ss.getSheetByName('Config_Varieties');
+  sh.getRange(2,1,Math.max(0, sh.getLastRow()-1),3).clearContent();
+  const rows = varieties
+    .filter(v => v && String(v.name||'').trim())
+    .map(v => [String(v.name).trim(), Number(v.price||0), !!v.active]);
+  if (rows.length) sh.getRange(2,1,rows.length,3).setValues(rows);
+}
+
+function api_saveDates_(ss, body){
+  ensureConfigSheets_(ss);
+  const sh = ss.getSheetByName('Config_Dates');
+  sh.getRange(2,1,Math.max(0, sh.getLastRow()-1),3).clearContent();
+
+  const pickup = Array.isArray(body.pickup) ? body.pickup : [];
+  const delivery = Array.isArray(body.delivery) ? body.delivery : [];
+
+  const rows = []
+    .concat(pickup.map(d => ['Pickup', String(d).trim(), true]))
+    .concat(delivery.map(d => ['Delivery', String(d).trim(), true]))
+    .filter(r => r[1]);
+
+  if (rows.length) sh.getRange(2,1,rows.length,3).setValues(rows);
+}
+
+function api_saveSlots_(ss, body){
+  ensureConfigSheets_(ss);
+  const sh = ss.getSheetByName('Config_Slots');
+  sh.getRange(2,1,Math.max(0, sh.getLastRow()-1),4).clearContent();
+
+  const pickup = Array.isArray(body.pickup) ? body.pickup : [];
+  const delivery = Array.isArray(body.delivery) ? body.delivery : [];
+
+  const rows = []
+    .concat(pickup.map(s => ['Pickup', String(s.start||'').trim(), String(s.label||'').trim(), true]))
+    .concat(delivery.map(s => ['Delivery', String(s.start||'').trim(), String(s.label||'').trim(), true]))
+    .filter(r => r[1] && r[2]);
+
+  if (rows.length) sh.getRange(2,1,rows.length,4).setValues(rows);
+}
+
+
+/* =====================================================================
+ * ORDER MANAGEMENT WORKFLOW (Pickup Orders + Pending Orders + Completed Orders)
+ *
+ * Goal:
+ *  - Delivery orders already go to: "Bookings" + "Delivery Orders" (your existing logic)
+ *  - Pickup orders should also go to: "Bookings" + "Pickup Orders"
+ *  - BOTH pickup + delivery should go to: "Pending Orders" (with Status dropdown)
+ *  - When Status in "Pending Orders" is changed to "Completed":
+ *      • append the order to "Completed Orders"
+ *      • delete the row from "Pending Orders"
+ *      • delete the row from "Pickup Orders" OR "Delivery Orders" (by Reference #)
+ *      • update Status in the master "Bookings" sheet to "Completed" (by Reference #)
+ *
+ * NOTE:
+ *  - This module does NOT touch your email/invoice/calendar logic.
+ *  - It is written to be resilient to header changes. It writes/reads by header names.
+ * ===================================================================== */
+
+/** Sheet names (change only if you renamed the tabs) */
+const SHEET_PICKUP_ORDERS    = 'Pickup Orders';
+const SHEET_PENDING_ORDERS   = 'Pending Orders';
+const SHEET_COMPLETED_ORDERS = 'Completed Orders';
+
+const STATUS_PENDING   = 'Pending';
+const STATUS_COMPLETED = 'Completed';
+
+/** Canonical headers (keep EXACT spelling + order for best results) */
+function pickupOrderHeaders_(){
+  return [
+    'Pick up or delivery date',
+    'Pick up/delivery time window',
+    'Customer Name',
+    'Customer Phone',
+    'Customer Email',
+    'Order Variety',
+    'Quantity',
+    'Amount',
+    'Payment method',
+    'Paid date',
+    'Invoice link in drive',
+    'Receipt link in drive',
+    'Invoice #',
+    'Reference #',
+    'Status'
+  ];
+}
+function pendingOrderHeaders_(){
+  return [
+    'Date of order',
+    'Customer Name',
+    'Customer Phone',
+    'Customer Email',
+    'Order Variety',
+    'Quantity',
+    'Amount',
+    'Payment method',
+    'Paid date',
+    'Invoice link in drive',
+    'Receipt link in drive',
+    'Invoice #',
+    'Reference #',
+    'Pick up or deliver',
+    'Pick up or delivery date',
+    'Pick up/delivery time window',
+    'Status',
+    'Completed by'
+  ];
+}
+function completedOrderHeaders_(){
+  return [
+    'Date of order',
+    'Customer Name',
+    'Customer Phone',
+    'Customer Email',
+    'Order Variety',
+    'Quantity',
+    'Amount',
+    'Payment method',
+    'Paid date',
+    'Invoice link in drive',
+    'Receipt link in drive',
+    'Invoice #',
+    'Reference #',
+    'Pick up or deliver',
+    'Pick up or delivery date',
+    'Pick up/delivery time window',
+    'Pick up or delivery person name',
+    'Completed date'
+  ];
+}
+
+/** Run this ONCE to create sheets + add Status dropdown */
+function setupOrderManagement(){
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+
+  ensureSheetWithHeaders_(ss, SHEET_PICKUP_ORDERS, pickupOrderHeaders_());
+  ensureSheetWithHeaders_(ss, SHEET_PENDING_ORDERS, pendingOrderHeaders_());
+  ensureSheetWithHeaders_(ss, SHEET_COMPLETED_ORDERS, completedOrderHeaders_());
+
+  applyStatusValidation_(ss.getSheetByName(SHEET_PENDING_ORDERS));
+
+  // Freeze header
+  [SHEET_PICKUP_ORDERS, SHEET_PENDING_ORDERS, SHEET_COMPLETED_ORDERS].forEach(n=>{
+    const sh = ss.getSheetByName(n);
+    if (sh) sh.setFrozenRows(1);
+  });
+
+  Logger.log('✅ setupOrderManagement: sheets ready.');
+}
+
+/**
+ * OPTIONAL helper: creates an installable onEdit trigger (runs as you).
+ * If you don't want triggers, the simple `onEdit(e)` below will still work
+ * when YOU edit the sheet.
+ */
+function installPendingOnEditTrigger(){
+  // Remove existing triggers for safety
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t=>{
+    if (t.getHandlerFunction && t.getHandlerFunction() === 'onEditPendingOrders_'){
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  ScriptApp.newTrigger('onEditPendingOrders_')
+    .forSpreadsheet(SpreadsheetApp.openById(SHEET_ID))
+    .onEdit()
+    .create();
+  Logger.log('✅ installPendingOnEditTrigger: created.');
+}
+
+/** Simple trigger fallback (fires when you edit the spreadsheet) */
+function onEdit(e){
+  try{ onEditPendingOrders_(e); } catch(_e){}
+}
+
+/** Installable trigger target */
+function onEditPendingOrders_(e){
+  if (!e || !e.range) return;
+  const sh = e.range.getSheet();
+  if (!sh || sh.getName() !== SHEET_PENDING_ORDERS) return;
+
+  const headers = pendingOrderHeaders_();
+  const statusCol = headerIndex_(headers, 'Status') + 1;
+  if (statusCol <= 0) return;
+
+  if (e.range.getRow() < 2 || e.range.getColumn() !== statusCol) return;
+
+  const newVal = String(e.value || '').trim();
+  if (newVal !== STATUS_COMPLETED) return;
+
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+
+  // Read row using canonical headers (first N columns)
+  const rowIndex = e.range.getRow();
+  const rowObj = readRowByHeaders_(sh, rowIndex, headers);
+
+  // Complete it
+  completeOrderFromPending_(ss, rowObj, rowIndex);
+}
+
+/**
+ * Called from doPost (already in your code):
+ * appendOrderToOperationalSheets({...})
+ *
+ * This function MUST remain named exactly this, because your doPost calls it.
+ */
+function appendOrderToOperationalSheets(order){
+  // NOTE: Do not touch/modify/append headers in any sheet.
+  if (!order || !order.refNo) throw new Error('appendOrderToOperationalSheets: missing refNo');
+
+  const ss = SpreadsheetApp.openById(order.sheetId || SHEET_ID);
+
+  // Booking sheet (your sheet name is "Booking Orders")
+  const bookingSheet =
+    ss.getSheetByName(order.bookingSheetName || 'Booking Orders') ||
+    ss.getSheetByName('Booking Orders');
+
+  if (!bookingSheet) throw new Error('Booking Orders sheet not found');
+
+  // Find the booking row for this reference #
+  const bookingRowObj = findRowObjectByRefNoTouch_(bookingSheet, order.refNo);
+  if (!bookingRowObj) throw new Error('Booking row not found for Reference #: ' + order.refNo);
+
+  // Pending Orders (must already exist; NO header changes here)
+  const pendingSheet = ss.getSheetByName('Pending Orders');
+  if (!pendingSheet) throw new Error('Pending Orders sheet not found');
+
+  // Always append to Pending (clone Booking row by existing headers)
+  appendObjectToSheetByExistingHeadersNoTouch_(pendingSheet, bookingRowObj);
+
+  // Pickup Orders: pickup-only (NO header changes here)
+  const mode = String(order.mode || order.fulfillment || '').toLowerCase();
+  const isDelivery = mode.indexOf('deliver') !== -1;
+
+  if (!isDelivery){
+    const pickupSheet = ss.getSheetByName('Pickup Orders');
+    if (!pickupSheet) throw new Error('Pickup Orders sheet not found');
+    appendObjectToSheetByExistingHeadersNoTouch_(pickupSheet, bookingRowObj);
+  } else {
+    // Delivery Orders: delivery-only (copy FULL booking row aligned to existing Delivery headers)
+    const deliverySheet = ss.getSheetByName('Delivery Orders');
+    if (!deliverySheet) throw new Error('Delivery Orders sheet not found');
+    if (!rowExistsByRefNoNoTouch_(deliverySheet, order.refNo)) {
+    appendObjectToSheetByExistingHeadersNoTouch_(deliverySheet, bookingRowObj);
+  }
+}
+
+  // Ensure Pending Status dropdown validation exists (no header changes)
+  try { ensurePendingStatusValidationNoTouch_(pendingSheet); } catch (e) {}
+
+  // If Pending has a Status column and it's blank, set it to Pending (cell value only)
+  try {
+    const pHeaders = pendingSheet.getRange(1,1,1,pendingSheet.getLastColumn()).getValues()[0].map(h => String(h||'').trim());
+    const statusCol = pHeaders.findIndex(h => h.toLowerCase() === 'status');
+    if (statusCol >= 0){
+      const lastRow = pendingSheet.getLastRow();
+      const cur = pendingSheet.getRange(lastRow, statusCol+1).getValue();
+      if (!cur) pendingSheet.getRange(lastRow, statusCol+1).setValue('Pending');
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+/**
+ * Read a Booking Orders row into an object keyed by Booking headers.
+ * No header changes, no sheet structure changes.
+ */
+function findRowObjectByRefNoTouch_(sheet, refNo){
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return null;
+
+  const headers = sheet.getRange(1,1,1,lastCol).getValues()[0].map(h => String(h||'').trim());
+  const refIdx = headers.findIndex(h => {
+    const k = String(h||'').trim().toLowerCase();
+    return (k === 'reference #' || k === 'reference#' || k === 'reference number' || k === 'reference');
+  });
+  if (refIdx < 0) throw new Error('Booking Orders missing "Reference #" column');
+
+  const data = sheet.getRange(2,1,lastRow-1,lastCol).getValues();
+  const target = String(refNo||'').trim();
+
+  for (let i=0;i<data.length;i++){
+    if (String(data[i][refIdx]||'').trim() === target){
+      const obj = {};
+      headers.forEach((h, c) => obj[h] = data[i][c]);
+      return obj;
+    }
+  }
+  return null;
+}
+
+/**
+ * Append an object to a sheet, aligned to the sheet's EXISTING header row.
+ * Does NOT write/append/modify headers.
+ */
+function appendObjectToSheetByExistingHeadersNoTouch_(sheet, obj){
+  const lastCol = sheet.getLastColumn();
+  if (lastCol < 1) throw new Error('Sheet has no headers: ' + sheet.getName());
+
+  const headers = sheet.getRange(1,1,1,lastCol).getValues()[0].map(h => String(h||'').trim());
+  const row = headers.map(h => (Object.prototype.hasOwnProperty.call(obj, h) ? obj[h] : ''));
+
+  sheet.appendRow(row);
+}
+
+
+/** Completes an order from Pending Orders */
+function completeOrderFromPending_(ss, pendingObj, pendingRowIndex){
+  const ref = String(getAny_(pendingObj, ['Reference #','Reference','Reference number','Reference Number']) || '').trim();
+  if (!ref) throw new Error('Pending row missing Reference #');
+
+  const pendingSheet   = ss.getSheetByName(SHEET_PENDING_ORDERS);
+  const completedSheet = ensureSheetWithHeaders_(ss, SHEET_COMPLETED_ORDERS, completedOrderHeaders_());
+
+  // Pull a clean copy from Bookings (more reliable than Pending if headers were edited)
+  const bookingSheet = ss.getSheetByName(SHEET_NAME || 'Bookings');
+  const bookingObj = bookingSheet ? findRowObjectByRef_(bookingSheet, ref) : null;
+
+  const merged = Object.assign({}, bookingObj || {}, pendingObj || {});
+
+  // Determine completed meta
+  const completedDate = new Date();
+  const completedBy = String(getAny_(merged, ['Pick up or delivery person name','Completed by','Completed By']) || '').trim();
+
+  const mode = String(getAny_(merged, ['Pick up or deliver','Pick up or delivery','Fulfillment','Mode']) || '').trim();
+  const isDelivery = /deliver/i.test(mode);
+
+  // Payment rules at completion:
+  // - If "Advance payment": keep paid date (if blank, set to completedDate)
+  // - Else: paid date becomes completedDate and payment method becomes "Paid at Pickup/Delivery"
+  let paymentMethod = String(getAny_(merged, ['Payment method','Payment Option Selected','Payment option selected','Payment option','Payment']) || '').trim();
+  let paidDate = String(getAny_(merged, ['Paid date','Payment Date']) || '').trim();
+
+  const isAdvance = /advance/i.test(paymentMethod) || String(getAny_(merged, ['Advance Payment'])||'') === 'Yes';
+
+  if (!paymentMethod){
+    paymentMethod = isAdvance ? 'Advance payment' : (isDelivery ? 'Paid at Delivery' : 'Paid at Pickup');
+  }
+
+  if (isAdvance){
+    if (!paidDate || /^pending$/i.test(paidDate)) paidDate = formatDateTime_(completedDate);
+  } else {
+    paymentMethod = isDelivery ? 'Paid at Delivery' : 'Paid at Pickup';
+    paidDate = formatDateTime_(completedDate);
+  }
+
+  // Build completed row by headers
+  const completedMap = {
+    'Date of order': getAny_(merged, ['Date of order','Timestamp']) || '',
+    'Customer Name': getAny_(merged, ['Customer Name','Name']) || '',
+    'Customer Phone': getAny_(merged, ['Customer Phone','Phone','Phone number']) || '',
+    'Customer Email': getAny_(merged, ['Customer Email','Email','Email address']) || '',
+    'Order Variety': getAny_(merged, ['Order Variety','Order variety','Order details','Line Items JSON']) || '',
+    'Quantity': getAny_(merged, ['Quantity','Total Qty']) || '',
+    'Amount': getAny_(merged, ['Amount','Total','Total amount']) || '',
+    'Payment method': paymentMethod,
+    'Paid date': paidDate,
+    'Invoice link in drive': getAny_(merged, ['Invoice link in drive','Invoice link','Invoice URL']) || '',
+    'Receipt link in drive': getAny_(merged, ['Receipt link in drive','Receipt link','Receipt URL']) || '',
+    'Invoice #': getAny_(merged, ['Invoice #','Invoice # ','Invoice Number','Invoice']) || '',
+    'Reference #': ref,
+    'Pick up or deliver': isDelivery ? 'Delivery' : 'Pickup',
+    'Pick up or delivery date': getAny_(merged, ['Pick up or delivery date','Date']) || '',
+    'Pick up/delivery time window': getAny_(merged, ['Pick up/delivery time window','Delivery Window','Delivery Time Window','Time']) || '',
+    'Pick up or delivery person name': completedBy,
+    'Completed date': completedDate
+  };
+  appendByHeaders_(completedSheet, completedMap, completedOrderHeaders_());
+
+  // Delete row from Pending
+  if (pendingSheet) pendingSheet.deleteRow(pendingRowIndex);
+
+  // Delete from Pickup or Delivery sheet by ref
+  deleteByReference_(ss.getSheetByName(SHEET_PICKUP_ORDERS), ref);
+  deleteByReference_(ss.getSheetByName(DELIVERY_SHEET_NAME || 'Delivery Orders'), ref);
+
+  // Update Booking sheet status -> Completed
+  if (bookingSheet) updateBookingStatusByRef_(bookingSheet, ref, STATUS_COMPLETED, completedDate);
+
+  Logger.log('✅ completed ref=' + ref);
+}
+
+/* ========================= HELPERS (HEADER-SAFE) ========================= */
+
+function ensureSheetWithHeaders_(ss, name, headers){
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+
+  // Force header row for the first N columns (do NOT delete extra columns)
+  sh.getRange(1,1,1,headers.length).setValues([headers]);
+
+  return sh;
+}
+
+function applyStatusValidation_(pendingSheet){
+  if (!pendingSheet) return;
+  const headers = pendingOrderHeaders_();
+  const statusCol = headerIndex_(headers, 'Status') + 1;
+  if (statusCol <= 0) return;
+
+  const lastRow = Math.max(pendingSheet.getLastRow(), 2);
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList([STATUS_PENDING, STATUS_COMPLETED], true)
+    .setAllowInvalid(false)
+    .build();
+  pendingSheet.getRange(2, statusCol, lastRow-1, 1).setDataValidation(rule);
+}
+
+function headerIndex_(headers, name){
+  const target = normHeader_(name);
+  for (let i=0;i<headers.length;i++){
+    if (normHeader_(headers[i]) === target) return i;
+  }
+  return -1;
+}
+function normHeader_(s){
+  return String(s||'').toLowerCase().replace(/\s+/g,' ').trim();
+}
+
+function readRowByHeaders_(sheet, rowIndex, canonicalHeaders){
+  const values = sheet.getRange(rowIndex, 1, 1, canonicalHeaders.length).getValues()[0];
+  const obj = {};
+  canonicalHeaders.forEach((h,i)=> obj[h] = values[i]);
+  return obj;
+}
+
+function appendByHeaders_(sheet, map, canonicalHeaders){
+  // Write values in the canonical header order, so headings always match values.
+  const row = canonicalHeaders.map(h => (map[h] !== undefined ? map[h] : ''));
+  sheet.appendRow(row);
+}
+
+function getAny_(obj, keys){
+  if (!obj) return '';
+  for (let i=0;i<keys.length;i++){
+    const k = keys[i];
+    if (obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== '') return obj[k];
+    // fuzzy
+    const nk = normHeader_(k);
+    for (const kk in obj){
+      if (normHeader_(kk) === nk && obj[kk] !== undefined && obj[kk] !== null && String(obj[kk]).trim() !== '') return obj[kk];
+    }
+  }
+  return '';
+}
+
+function findRowObjectByRef_(sheet, ref){
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(1,1,1,lastCol).getValues()[0].map(String);
+  const refIdx = findColByNames_(headers, ['Reference #','Reference','Reference number']);
+  if (refIdx < 0) return null;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const refVals = sheet.getRange(2, refIdx+1, lastRow-1, 1).getValues().map(r=>String(r[0]||'').trim());
+  let row = -1;
+  for (let i=0;i<refVals.length;i++){
+    if (refVals[i] === ref){ row = i+2; break; }
+  }
+  if (row < 0) return null;
+
+  const vals = sheet.getRange(row,1,1,lastCol).getValues()[0];
+  const obj = {};
+  headers.forEach((h,i)=> obj[h] = vals[i]);
+  return obj;
+}
+
+function findColByNames_(headers, names){
+  const norm = headers.map(h=>normHeader_(h));
+  for (let n=0;n<names.length;n++){
+    const target = normHeader_(names[n]);
+    const idx = norm.indexOf(target);
+    if (idx >= 0) return idx;
+  }
+  // fallback: contains 'reference'
+  const idx2 = norm.findIndex(h=>h.indexOf('reference') !== -1);
+  return idx2;
+}
+
+function deleteByReference_(sheet, ref){
+  if (!sheet || !ref) return;
+  const lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return;
+
+  const headers = sheet.getRange(1,1,1,lastCol).getValues()[0].map(String);
+  const refIdx = findColByNames_(headers, ['Reference #','Reference','Reference number']);
+  if (refIdx < 0) return;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const vals = sheet.getRange(2, refIdx+1, lastRow-1, 1).getValues().map(r=>String(r[0]||'').trim());
+  for (let i=vals.length-1;i>=0;i--){
+    if (vals[i] === ref){
+      sheet.deleteRow(i+2);
+      return;
+    }
+  }
+}
+
+function updateBookingStatusByRef_(bookingSheet, ref, status, completedDate){
+  const lastCol = bookingSheet.getLastColumn();
+  const headers = bookingSheet.getRange(1,1,1,lastCol).getValues()[0].map(String);
+  const refIdx = findColByNames_(headers, ['Reference #','Reference','Reference number']);
+  const statusIdx = findColByNames_(headers, ['Status','Order Status']);
+  const updatedIdx = findColByNames_(headers, ['Updated At','Updated']);
+
+  if (refIdx < 0) return;
+
+  const lastRow = bookingSheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const vals = bookingSheet.getRange(2, refIdx+1, lastRow-1, 1).getValues().map(r=>String(r[0]||'').trim());
+  for (let i=0;i<vals.length;i++){
+    if (vals[i] === ref){
+      const row = i+2;
+      if (statusIdx >= 0) bookingSheet.getRange(row, statusIdx+1).setValue(status);
+      if (updatedIdx >= 0) bookingSheet.getRange(row, updatedIdx+1).setValue(completedDate || new Date());
+      return;
+    }
+  }
+}
+
+function sortByHeaderIfExists_(sheet, headerName, ascending){
+  if (!sheet) return;
+  const lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return;
+  const headers = sheet.getRange(1,1,1,lastCol).getValues()[0].map(String);
+  const idx = headers.map(normHeader_).indexOf(normHeader_(headerName));
+  if (idx < 0) return;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 3) return;
+
+  sheet.getRange(2,1,lastRow-1,lastCol).sort({column: idx+1, ascending: !!ascending});
+}
+
+function formatDateTime_(d){
+  const tz = Session.getScriptTimeZone() || 'GMT';
+  return Utilities.formatDate(d, tz, 'M/d/yyyy HH:mm:ss');
+}
+
+/** Convenience for Run dropdown */
+function RUN_SETUP_NOW(){
+  setupOrderManagement();
+}
+
+
+
+/* ========================= ORDER MGMT OVERRIDES v3 =========================
+ * Fixes:
+ *  - Delete from correct mode sheet (Pickup OR Delivery) when Pending->Completed
+ *  - Update Booking status reliably (by Reference # OR Invoice #)
+ *  - Completed Orders row filled from Booking row (fallback to Pending)
+ *  - More robust deleteByReference_ for Delivery Orders header variations
+ * ======================================================================= */
+
+function getBookingSheet_(ss){
+  return ss.getSheetByName(SHEET_NAME)
+      || ss.getSheetByName('Booking Orders')
+      || ss.getSheetByName('Booking')
+      || ss.getSheetByName('Bookings');
+}
+
+function _norm_(s){
+  return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'');
+}
+
+function findRowIndexByAnyId_(sheet, ref, invoice){
+  if (!sheet) return -1;
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return -1;
+
+  const headers = sheet.getRange(1,1,1,lastCol).getValues()[0].map(String);
+  const refIdx = findColByNames_(headers, ['Reference #','Reference','Reference number','Ref','Ref #','Reference numb','Reference num']);
+  const invIdx = findColByNames_(headers, ['Invoice #','Invoice','Invoice Number','Invoice No','Invoice numb','Invoice num']);
+
+  const wantRef = String(ref||'').trim();
+  const wantInv = String(invoice||'').trim();
+
+  // 1) Fast path: search in Reference column if present
+  if (refIdx >= 0 && wantRef){
+    const vals = sheet.getRange(2, refIdx+1, lastRow-1, 1).getValues();
+    for (let i=0;i<vals.length;i++){
+      if (String(vals[i][0]||'').trim() === wantRef) return i+2;
+    }
+  }
+
+  // 2) Search in Invoice column if present
+  if (invIdx >= 0 && wantInv){
+    const vals = sheet.getRange(2, invIdx+1, lastRow-1, 1).getValues();
+    for (let i=0;i<vals.length;i++){
+      if (String(vals[i][0]||'').trim() === wantInv) return i+2;
+    }
+  }
+
+  // 3) Fallback: scan all rows for either id (safer if columns were renamed)
+  const data = sheet.getRange(2,1,lastRow-1,lastCol).getValues();
+  for (let r=0;r<data.length;r++){
+    const row = data[r].map(v=>String(v||'').trim());
+    if ((wantRef && row.indexOf(wantRef) !== -1) || (wantInv && row.indexOf(wantInv) !== -1)){
+      return r+2;
+    }
+  }
+  return -1;
+}
+
+function findRowObjectByAnyId_(sheet, ref, invoice){
+  const row = findRowIndexByAnyId_(sheet, ref, invoice);
+  if (row < 2) return null;
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(1,1,1,lastCol).getValues()[0].map(String);
+  const values  = sheet.getRange(row,1,1,lastCol).getValues()[0];
+  const obj = {};
+  for (let c=0;c<headers.length;c++) obj[headers[c]] = values[c];
+  return obj;
+}
+
+function updateBookingStatusByAnyId_(bookingSheet, ref, invoice, status, completedDate){
+  if (!bookingSheet) return;
+
+  const row = findRowIndexByAnyId_(bookingSheet, ref, invoice);
+  if (row < 2) return;
+
+  const lastCol = bookingSheet.getLastColumn();
+  const headers = bookingSheet.getRange(1,1,1,lastCol).getValues()[0].map(String);
+
+  const statusIdx  = findColByNames_(headers, ['Status','Order Status','order status']);
+  const updatedIdx = findColByNames_(headers, ['Updated At','Updated','Last Updated']);
+  const completedIdx = findColByNames_(headers, ['Completed date','Completed Date']);
+
+  if (statusIdx >= 0) bookingSheet.getRange(row, statusIdx+1).setValue(status);
+  if (updatedIdx >= 0) bookingSheet.getRange(row, updatedIdx+1).setValue(new Date());
+  if (completedIdx >= 0) bookingSheet.getRange(row, completedIdx+1).setValue(completedDate || new Date());
+}
+
+/**
+ * Override: deleteByReference_ now supports ref OR invoice, and falls back to scanning
+ * if header names don't match perfectly.
+ */
+function deleteByReference_(sheet, ref, invoice){
+  if (!sheet) return;
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return;
+
+  const headers = sheet.getRange(1,1,1,lastCol).getValues()[0].map(String);
+  const refIdx = findColByNames_(headers, ['Reference #','Reference','Reference number','Ref','Ref #','Reference numb','Reference num']);
+  const invIdx = findColByNames_(headers, ['Invoice #','Invoice','Invoice Number','Invoice No','Invoice numb','Invoice num']);
+
+  const wantRef = String(ref||'').trim();
+  const wantInv = String(invoice||'').trim();
+
+  // Prefer deleting by Reference column if available
+  if (refIdx >= 0 && wantRef){
+    const vals = sheet.getRange(2, refIdx+1, lastRow-1, 1).getValues().map(r=>String(r[0]||'').trim());
+    for (let i=vals.length-1;i>=0;i--){
+      if (vals[i] === wantRef){ sheet.deleteRow(i+2); return; }
+    }
+  }
+
+  // Else delete by Invoice column if available
+  if (invIdx >= 0 && wantInv){
+    const vals = sheet.getRange(2, invIdx+1, lastRow-1, 1).getValues().map(r=>String(r[0]||'').trim());
+    for (let i=vals.length-1;i>=0;i--){
+      if (vals[i] === wantInv){ sheet.deleteRow(i+2); return; }
+    }
+  }
+
+  // Fallback: scan full rows for either id
+  const data = sheet.getRange(2,1,lastRow-1,lastCol).getValues();
+  for (let r=data.length-1;r>=0;r--){
+    const row = data[r].map(v=>String(v||'').trim());
+    if ((wantRef && row.indexOf(wantRef) !== -1) || (wantInv && row.indexOf(wantInv) !== -1)){
+      sheet.deleteRow(r+2);
+      return;
+    }
+  }
+}
+
+/**
+ * Override: completion logic
+ * - Read booking row by Reference # OR Invoice #
+ * - Write completed row with ALL required fields
+ * - Delete from Pending + correct mode sheet only
+ * - Update Booking status reliably
+ */
+function completeOrderFromPending_(ss, pendingObj, pendingRowIndex){
+  const pendingSheet = ss.getSheetByName(SHEET_PENDING_ORDERS);
+
+  // Grab ids
+  const ref = String(getAny_(pendingObj, ['Reference #','Reference','Reference number','Reference Number','Ref','Ref #']) || '').trim();
+  const inv = String(getAny_(pendingObj, ['Invoice #','Invoice','Invoice Number','Invoice No']) || '').trim();
+  if (!ref && !inv) throw new Error('Pending row missing Reference # / Invoice #');
+
+  const bookingSheet = getBookingSheet_(ss);
+  const bookingObj = bookingSheet ? findRowObjectByAnyId_(bookingSheet, ref, inv) : null;
+  const merged = Object.assign({}, bookingObj || {}, pendingObj || {});
+
+  const completedDate = new Date();
+
+  // Determine mode
+  const modeRaw = String(getAny_(merged, ['Pick up or deliver','Pick up or delivery','Fulfillment','Mode']) || '').toLowerCase();
+  const isDelivery = modeRaw.indexOf('deliver') !== -1;
+
+  // Payment method + paid date rules at completion
+  const payRaw = String(getAny_(merged, ['Payment method','Payment Option Selected','Payment details','Advance Payment']) || '').trim();
+  const isAdvance = /advance/i.test(payRaw) || String(getAny_(merged, ['Advance Payment','Advance payment'])||'').toLowerCase()==='yes';
+
+  let paymentMethod = payRaw || (isAdvance ? 'Advance payment' : (isDelivery ? 'Paid at Delivery' : 'Paid at Pickup'));
+  if (!isAdvance){
+    paymentMethod = isDelivery ? 'Paid at Delivery' : 'Paid at Pickup';
+  }
+
+  let paidDate = getAny_(merged, ['Paid date','Payment Date','Paid Date']) || '';
+  if (!isAdvance || String(paidDate).toLowerCase()==='pending' || paidDate===''){
+    // for pay-at, paid date is completion time; for advance keep existing (but if missing, set now)
+    paidDate = completedDate;
+  }
+
+  // Build completed row exactly as you requested
+  const completedMap = {
+    'Date of order': getAny_(merged, ['Date of order','Timestamp','Date']) || '',
+    'Customer Name': getAny_(merged, ['Customer Name','Name']) || '',
+    'Customer Phone': getAny_(merged, ['Customer Phone','Phone number','Phone']) || '',
+    'Customer Email': getAny_(merged, ['Customer Email','Email address','Email']) || '',
+    'Order Variety': getAny_(merged, ['Order Variety','Order variety','Order details','Items']) || '',
+    'Quantity': getAny_(merged, ['Quantity','Quality']) || '',
+    'Amount': getAny_(merged, ['Amount','Total','Total amount']) || '',
+    'Payment method': paymentMethod,
+    'Paid date': paidDate,
+    'Invoice link in drive': getAny_(merged, ['Invoice link in drive','Link to invoice','Invoice URL','Invoice']) || '',
+    'Receipt link in drive': getAny_(merged, ['Receipt link in drive','Receipt URL','Link to Payment receipt']) || '',
+    'Invoice #': getAny_(merged, ['Invoice #','Invoice Number','Invoice']) || '',
+    'Reference #': ref || getAny_(merged, ['Reference #','Reference','Reference number']) || '',
+    'Pick up or deliver': isDelivery ? 'Delivery' : 'Pickup',
+    'Pick up or delivery date': getAny_(merged, ['Pick up or delivery date','Delivery Date','Pick up date','Date']) || '',
+    'Pick up/delivery time window': getAny_(merged, ['Pick up/delivery time window','Delivery Time Window','Pick up time window','Time','Delivery Window']) || '',
+    'Pick up or delivery person name': getAny_(merged, ['Pick up or delivery person name','Completed by','Completed By']) || '',
+    'Completed date': completedDate
+  };
+
+  const completedSheet = ensureSheetWithHeaders_(ss, SHEET_COMPLETED_ORDERS, completedOrderHeaders_());
+  appendByHeaders_(completedSheet, completedMap, completedOrderHeaders_());
+
+  // Delete from Pending
+  if (pendingSheet) pendingSheet.deleteRow(pendingRowIndex);
+
+  // Delete from correct mode sheet only
+  if (isDelivery){
+    deleteByReference_(ss.getSheetByName(DELIVERY_SHEET_NAME || 'Delivery Orders'), ref, inv);
+  } else {
+    deleteByReference_(ss.getSheetByName(SHEET_PICKUP_ORDERS), ref, inv);
+  }
+
+  // Update booking status
+  if (bookingSheet) updateBookingStatusByAnyId_(bookingSheet, ref, inv, STATUS_COMPLETED, completedDate);
+
+  Logger.log('✅ Completed ref=' + (ref||'') + ' inv=' + (inv||''));
+}
+
+
+function ensurePendingStatusValidationNoTouch_(pendingSheet){
+  if (!pendingSheet) return;
+  const lastCol = pendingSheet.getLastColumn();
+  if (!lastCol) return;
+  const headers = pendingSheet.getRange(1,1,1,lastCol).getValues()[0].map(h => String(h||'').trim());
+  const statusIdx = headers.findIndex(h => String(h).trim().toLowerCase() === 'status');
+  if (statusIdx < 0) return;
+
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Pending','Completed'], true)
+    .setAllowInvalid(false)
+    .build();
+
+  const lastRow = pendingSheet.getLastRow();
+  if (lastRow < 2) return;
+  pendingSheet.getRange(2, statusIdx+1, lastRow-1, 1).setDataValidation(rule);
+}
+
+
+function rowExistsByRefNoNoTouch_(sheet, refNo){
+  if (!sheet) return false;
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return false;
+
+  const headers = sheet.getRange(1,1,1,lastCol).getValues()[0].map(h => String(h||'').trim());
+  const refIdx = headers.findIndex(h => String(h).trim().toLowerCase() === 'reference #' ||
+                                       String(h).trim().toLowerCase() === 'reference#' ||
+                                       String(h).trim().toLowerCase() === 'reference number');
+  if (refIdx < 0) return false;
+
+  const target = String(refNo||'').trim();
+  if (!target) return false;
+
+  const vals = sheet.getRange(2, refIdx+1, lastRow-1, 1).getValues();
+  for (let i=0; i<vals.length; i++){
+    if (String(vals[i][0]||'').trim() === target) return true;
+  }
+  return false;
+}
+
