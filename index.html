@@ -782,7 +782,7 @@ label{
     </div>
   <script>
     const WEB_APP_URL =
-      "https://script.google.com/macros/s/AKfycbyHflw4L0DDOC4TPeB6tDbwOpC747oRcPA_Rhpi7sSDnRe4T74L7GLDvsgFqdA81XpC/exec";
+      "https://script.google.com/macros/s/AKfycbxBKypdOh-qTsT1_P5nTtt82ZwK-pUcQegp987fgbDYzvnL7Vu5L2dyQqp8dzbVvfFU/exec";
 
     // Use CONFIG_URL for GET (can include ?action=...), but ALWAYS post to base /exec
     const CONFIG_URL = WEB_APP_URL;
@@ -1402,7 +1402,7 @@ function buildDeliveryWindowSelect(){
 
         // --- Payment date/time must not be in the future ---
         const now3 = new Date();
-        const todayStr = ymd(now3);
+        const todayStr = now3.toISOString().slice(0,10);
         const paymentDateStr = f.paymentDate.value;
 
         let paymentErrorMsg = '';
@@ -1431,11 +1431,11 @@ function buildDeliveryWindowSelect(){
     }
 
     function toLocalISO(dateStr, timeStr){
-      const cleanDate = String(dateStr || '').trim();
-      if (!cleanDate) return '';
-      const cleanTime = String(timeStr || '00:00').trim();
-      const normalizedTime = cleanTime.length === 5 ? (cleanTime + ':00') : cleanTime;
-      return `${cleanDate}T${normalizedTime}`;
+      const parts = dateStr.split('-');
+      const y = Number(parts[0]), m = Number(parts[1]), d = Number(parts[2]);
+      const tparts = (timeStr || '00:00').split(':');
+      const hh = Number(tparts[0] || 0), mm = Number(tparts[1] || 0);
+      return new Date(y, m-1, d, hh, mm, 0).toISOString();
     }
 
     function show(type, text){
