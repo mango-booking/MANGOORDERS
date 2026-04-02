@@ -574,7 +574,7 @@ label{
           <div class="section">
             <h3>2) Order Details</h3>
             <div class="mini" style="margin-bottom:6px">
-              Prices — Alphonso $50 · Kesar $40 · Badami $35 · Langra $30 · Dasheri $20
+              Prices — 
             </div>
 
             <div class="items-wrap">
@@ -623,21 +623,13 @@ label{
                 <label id="timeLabel">Pickup Time Window <span class="req">*</span></label>
                 <select id="timeSelect" name="time" required>
                   <option value="">— Select time window —</option>
-                  <option value="09:00">9:00 AM – 12:00 PM</option>
-                  <option value="12:00">12:00 PM – 3:00 PM</option>
-                  <option value="15:00">3:00 PM – 6:00 PM</option>
-                  <option value="18:00">6:00 PM – 8:00 PM</option>
-                </select>
+                   </select>
               </div>
 
               <div id="deliveryWindowWrap" class="hidden">
                 <label>Delivery Time Window <span class="req">*</span></label>
                 <select id="deliveryWindow" name="deliveryWindow">
                   <option value="">— Select time window —</option>
-                  <option value="9:00 AM – 12:00 PM" data-start="09:00">9:00 AM – 12:00 PM</option>
-                  <option value="12:00 PM – 3:00 PM" data-start="12:00">12:00 PM – 3:00 PM</option>
-                  <option value="3:00 PM – 6:00 PM" data-start="15:00">3:00 PM – 6:00 PM</option>
-                  <option value="6:00 PM – 8:00 PM" data-start="18:00">6:00 PM – 8:00 PM</option>
                 </select>
               </div>
 
@@ -782,18 +774,18 @@ label{
     </div>
   <script>
     const WEB_APP_URL =
-      "https://script.google.com/macros/s/AKfycbxBKypdOh-qTsT1_P5nTtt82ZwK-pUcQegp987fgbDYzvnL7Vu5L2dyQqp8dzbVvfFU/exec";
+      "https://script.google.com/macros/s/AKfycbzunhSOP7zpEoUwwpnxE_n92KRNYu7jnSG6p-kEr47-DUhVG_X11SNItrg66IGoOAMp/exec";
 
     // Use CONFIG_URL for GET (can include ?action=...), but ALWAYS post to base /exec
     const CONFIG_URL = WEB_APP_URL;
     const POST_URL = String(WEB_APP_URL).split('?')[0];
 
     let PRICES = {
-      "Alphonso (Apoos)":50,
-      "Kesar":40,
-      "Badami":35,
-      "Langra":30,
-      "Dasheri":20
+      //"Alphonso (Apoos)":50,
+      //"Kesar":40,
+      //"Badami":35,
+      //"Langra":30,
+      //"Dasheri":20
     };
 
     // Live config (from Config_* sheets)
@@ -925,10 +917,10 @@ label{
     }
 
     const TIME_WINDOWS = [
-      {start:"09:00", label:"9:00 AM – 12:00 PM"},
-      {start:"12:00", label:"12:00 PM – 3:00 PM"},
-      {start:"15:00", label:"3:00 PM – 6:00 PM"},
-      {start:"18:00", label:"6:00 PM – 8:00 PM"},
+      //{start:"09:00", label:"9:00 AM – 12:00 PM"},
+      //{start:"12:00", label:"12:00 PM – 3:00 PM"},
+      //{start:"15:00", label:"3:00 PM – 6:00 PM"},
+      //{start:"18:00", label:"6:00 PM – 8:00 PM"},
     ];
 
     function formatDateForOption(d){
