@@ -802,7 +802,7 @@ label{
     </div>
   <script>
     const WEB_APP_URL =
-      "https://script.google.com/macros/s/AKfycbyql2PSlfQIlO8q9q5PcUYfUknuN9ZF4iycmLFOzlOC3HAWDjUbQ-9h02D3dfV2DCVz/exec";
+      "https://script.google.com/macros/s/AKfycbxepI2bdaA7HiSOK_ooeKX5SAbgCT5K_DCHpcg7PhHdpsbyI9QrLSvBvQ8-cwkvDSOz/exec";
 
     // Use CONFIG_URL for GET (can include ?action=...), but ALWAYS post to base /exec
     const CONFIG_URL = WEB_APP_URL;
@@ -817,7 +817,7 @@ label{
     };
 
     // Live config (from Config_* sheets)
-    let LIVE_VARIETIES = null;        // array of {name,price,active}
+    let LIVE_VARIETIES = null;        // array of {name,price,active,expectedAvailableDate}
     let LIVE_DATES_PICKUP = null;     // array of YYYY-MM-DD
     let LIVE_DATES_DELIVERY = null;   // array of YYYY-MM-DD
     let SLOTS_PICKUP = null;          // array of {start,label}
@@ -838,9 +838,11 @@ label{
 
         // Varieties/prices
         if (Array.isArray(data.varieties)){
-          LIVE_VARIETIES = data.varieties.filter(v=>v && v.active);
+          LIVE_VARIETIES = data.varieties.filter(v=>v && String((v && v.name) || '').trim());
           const next = {};
-          LIVE_VARIETIES.forEach(v => { next[String(v.name)] = Number(v.price||0); });
+          LIVE_VARIETIES
+            .filter(v => v && v.active)
+            .forEach(v => { next[String(v.name)] = Number(v.price||0); });
           if (Object.keys(next).length) PRICES = next;
         }
 
@@ -884,16 +886,93 @@ label{
       }
     }
 
+    function formatExpectedDateForDisplay(dateStr){
+      if (dateStr === null || typeof dateStr === 'undefined' || dateStr === '') return '';
+
+      if (Object.prototype.toString.call(dateStr) === '[object Date]' && !isNaN(dateStr.getTime())){
+        return dateStr.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'numeric' });
+      }
+
+      const s = String(dateStr || '').trim();
+      if (!s) return '';
+
+      const ymd = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (ymd){
+        const d = new Date(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]));
+        if (!isNaN(d.getTime())){
+          return d.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'numeric' });
+        }
+      }
+
+      const parsed = new Date(s);
+      if (!isNaN(parsed.getTime())){
+        return parsed.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'numeric' });
+      }
+
+      const pretty = s.match(/^[A-Za-z]{3,9}\s+[A-Za-z]{3,9}\s+\d{1,2}\s+\d{4}/);
+      if (pretty) return pretty[0];
+
+      return s.replace(/\s+\d{2}:\d{2}:\d{2}.*$/, '').trim();
+    }
+
+    function getVarietyConfigByName(name){
+      const key = String(name || '').trim();
+      if (!key) return null;
+      if (Array.isArray(LIVE_VARIETIES)){
+        const found = LIVE_VARIETIES.find(v => String(v && v.name || '').trim() === key);
+        if (found) return found;
+      }
+      if (Object.prototype.hasOwnProperty.call(PRICES, key)){
+        return { name:key, price:Number(PRICES[key]||0), active:true, expectedAvailableDate:'' };
+      }
+      return null;
+    }
+
+    function isUnavailableVariety_(name){
+      const found = getVarietyConfigByName(name);
+      return !!(found && found.active === false);
+    }
+
+    function getUnavailableVarietyMessage_(name){
+      const found = getVarietyConfigByName(name);
+      const expected = formatExpectedDateForDisplay(found && (found.expectedAvailableDate || found.expectedDate || ''));
+      return expected
+        ? `Sorry, currently not available. Hopefully we will have it by ${expected}.`
+        : 'Sorry, currently not available.';
+    }
+
+    function buildVarietyOptionsHtml_(current){
+      const currentValue = String(current || '').trim();
+      let optionsHtml = '<option value="" disabled ' + (currentValue ? '' : 'selected') + '>Select…</option>';
+
+      if (Array.isArray(LIVE_VARIETIES) && LIVE_VARIETIES.length){
+        LIVE_VARIETIES.forEach(v=>{
+          const name = String(v && v.name || '').trim();
+          if (!name) return;
+          const isActive = !!(v && v.active);
+          const expected = formatExpectedDateForDisplay(v && (v.expectedAvailableDate || v.expectedDate || ''));
+          const label = isActive
+            ? `${name}`
+            : `${name} — Sorry, currently not available${expected ? ' (Expected: ' + expected + ')' : ''}`;
+          const selected = name === currentValue ? ' selected' : '';
+          const disabled = isActive ? '' : ' disabled';
+          optionsHtml += `<option value="${name.replace(/"/g, '&quot;')}"${selected}${disabled}>${label}</option>`;
+        });
+        return optionsHtml;
+      }
+
+      for (const v in PRICES){
+        optionsHtml += `<option${v===currentValue ? ' selected' : ''}>${v}</option>`;
+      }
+      return optionsHtml;
+    }
+
     function refreshVarietySelects(){
       const selects = document.querySelectorAll('#itemsTable select');
       selects.forEach(sel=>{
         const current = sel.value;
-        let optionsHtml = '<option disabled ' + (current ? '' : 'selected') + '>Select…</option>';
-        for (const v in PRICES){
-          optionsHtml += `<option${v===current ? ' selected' : ''}>${v}</option>`;
-        }
-        sel.innerHTML = optionsHtml;
-        if (!(current in PRICES)) sel.value = '';
+        sel.innerHTML = buildVarietyOptionsHtml_(current);
+        if (current && !getVarietyConfigByName(current)) sel.value = '';
       });
       // prices per-row get recalculated by recalcTotals() later
     }
@@ -1247,11 +1326,7 @@ function buildDeliveryWindowSelect(){
       const tdVar = document.createElement('td');
       const sel = document.createElement('select');
       sel.name='itemVariety[]'; sel.required=true;
-      let optionsHtml = '<option value="" disabled ' + (variety ? '' : 'selected') + '>Select…</option>';
-      for (const v in PRICES){
-        optionsHtml += `<option${v===variety ? ' selected' : ''}>${v}</option>`;
-      }
-      sel.innerHTML = optionsHtml;
+      sel.innerHTML = buildVarietyOptionsHtml_(variety);
       tdVar.appendChild(sel);
 
       const tdPrice = document.createElement('td');
@@ -1284,7 +1359,12 @@ function buildDeliveryWindowSelect(){
 
       function recalcRow(){
         const vv = sel.value;
-        const p = PRICES[vv] || 0;
+        if (vv && isUnavailableVariety_(vv)){
+          alert(getUnavailableVarietyMessage_(vv));
+          sel.value = '';
+        }
+        const activeValue = sel.value;
+        const p = PRICES[activeValue] || 0;
         const q = Number(qtyInput.value || 0);
         priceSpan.textContent = fmt(p);
         lineSpan.textContent = fmt(p*q);
@@ -1308,7 +1388,7 @@ function buildDeliveryWindowSelect(){
       rows.forEach(tr => {
         const v = tr.querySelector('select').value;
         const q = Number(tr.querySelector('input').value || 0);
-        if (v && q>0){
+        if (v && q>0 && !isUnavailableVariety_(v)){
           const unit = PRICES[v] || 0;
           items.push({v,q,unit,line:unit*q});
         }
@@ -1477,6 +1557,16 @@ function buildDeliveryWindowSelect(){
           return isDelivery ? 'Delivery time cannot be in the past.' :
                               'Pickup time cannot be in the past.';
         }
+      }
+
+      const unavailableSelect = Array.from(itemsBody.querySelectorAll('tr select')).find(sel => {
+        const value = String(sel.value || '').trim();
+        return value && isUnavailableVariety_(value);
+      });
+      if (unavailableSelect){
+        unavailableSelect.focus();
+        alert(getUnavailableVarietyMessage_(unavailableSelect.value));
+        return 'Please select an available mango variety.';
       }
 
       if (validLineItems().length === 0) {
