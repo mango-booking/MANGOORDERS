@@ -603,12 +603,40 @@ label{
             <div class="option-group" id="fulfillmentGroup">
               <label class="choice">
                 <input type="radio" name="fulfillment" value="Pickup" checked>
-                <span class="label-text">Pickup for Free</span>
+                <span class="label-text">Pickup</span>
               </label>
               <label class="choice">
                 <input type="radio" name="fulfillment" value="Delivery">
-                <span class="label-text">Delivery for extra $10</span>
+                <span class="label-text">Delivery</span>
               </label>
+            </div>
+
+            <div id="pickupLocationWrap" class="section" style="margin-top:12px">
+              <label>Pickup Location <span class="req">*</span></label>
+              <div class="option-group">
+                <label class="choice">
+                  <input type="radio" name="pickupLocation" value="brampton" checked>
+                  <span class="label-text"><strong>Brampton</strong><br>28 Walbrook road<br>Brampton L6X4N4</span>
+                </label>
+                <label class="choice">
+                  <input type="radio" name="pickupLocation" value="mississauga">
+                  <span class="label-text"><strong>Mississauga</strong><br>Heartland plaza<br>6045 Mavis Rd, Mississauga, ON L5R 4G6</span>
+                </label>
+              </div>
+            </div>
+
+            <div id="deliveryOptionWrap" class="section hidden" style="margin-top:12px">
+              <label>Delivery Option <span class="req">*</span></label>
+              <div class="option-group">
+                <label class="choice">
+                  <input type="radio" name="deliveryOption" value="oakville_scarborough" checked>
+                  <span class="label-text">Delivery of up to four boxes from Oakville to Scarborough will cost $8 in delivery fees.</span>
+                </label>
+                <label class="choice">
+                  <input type="radio" name="deliveryOption" value="kwc_guelph_durham">
+                  <span class="label-text">Delivery of up to four boxes in KWC, Guelph &amp; Durhum Region will cost $10 in delivery fees.</span>
+                </label>
+              </div>
             </div>
 
             <div class="grid3" style="margin-top:10px">
@@ -774,7 +802,7 @@ label{
     </div>
   <script>
     const WEB_APP_URL =
-      "https://script.google.com/macros/s/AKfycbyodYsW5xQNAoNiKE7mTBZ-N6Ww1VOPxlMnnqZdaP0IaFurdqyEssOd2HmB2KWmFGDZ/exec";
+      "https://script.google.com/macros/s/AKfycbyql2PSlfQIlO8q9q5PcUYfUknuN9ZF4iycmLFOzlOC3HAWDjUbQ-9h02D3dfV2DCVz/exec";
 
     // Use CONFIG_URL for GET (can include ?action=...), but ALWAYS post to base /exec
     const CONFIG_URL = WEB_APP_URL;
@@ -871,6 +899,26 @@ label{
     }
 
     const DELIVERY_FEE = 10;
+    const DELIVERY_OPTIONS = {
+      oakville_scarborough: {
+        label: 'Delivery of up to four boxes from Oakville to Scarborough will cost $8 in delivery fees.',
+        fee: 8
+      },
+      kwc_guelph_durham: {
+        label: 'Delivery of up to four boxes in KWC, Guelph & Durhum Region will cost $10 in delivery fees.',
+        fee: 10
+      }
+    };
+    const PICKUP_LOCATIONS = {
+      brampton: {
+        label: 'Brampton',
+        address: '28 Walbrook road, Brampton L6X4N4'
+      },
+      mississauga: {
+        label: 'Mississauga',
+        address: 'Heartland plaza, 6045 Mavis Rd, Mississauga, ON L5R 4G6'
+      }
+    };
     const TAX_RATE = 0;
     const TAX_ON_DELIVERY = true;
     const ADVANCE_DISCOUNT_PER_BOX = 1;
@@ -881,6 +929,8 @@ label{
     const itemsBody = document.getElementById('itemsBody');
     const addRowBtn = document.getElementById('addRowBtn');
     const deliveryWindowWrap = document.getElementById('deliveryWindowWrap');
+    const pickupLocationWrap = document.getElementById('pickupLocationWrap');
+    const deliveryOptionWrap = document.getElementById('deliveryOptionWrap');
     const paymentFields = document.getElementById('paymentFields');
     const submitBtn = document.getElementById('submitBtn');
     const timeWrap = document.getElementById('timeWrap');
@@ -927,8 +977,34 @@ label{
       return d.toLocaleDateString(undefined, {weekday:'short', year:'numeric', month:'short', day:'numeric'});
     }
 
+    function getSelectedPickupLocation(){
+      return document.querySelector('input[name="pickupLocation"]:checked')?.value || 'brampton';
+    }
+
+    function getSelectedDeliveryOption(){
+      return document.querySelector('input[name="deliveryOption"]:checked')?.value || 'oakville_scarborough';
+    }
+
+    function getAvailabilityBucket_(modeKey){
+      if (!LIVE_AVAIL || !LIVE_AVAIL[modeKey]) return null;
+      const group = LIVE_AVAIL[modeKey];
+      if (modeKey === 'pickup'){
+        const selected = getSelectedPickupLocation();
+        if (group[selected] && typeof group[selected] === 'object' && !Array.isArray(group[selected])) return group[selected];
+      }
+      if (modeKey === 'delivery'){
+        const selected = getSelectedDeliveryOption();
+        if (group[selected] && typeof group[selected] === 'object' && !Array.isArray(group[selected])) return group[selected];
+      }
+      return group;
+    }
+
     function getSlotsFor_(modeKey, dateStr){
-      // modeKey: 'pickup' | 'delivery'
+      const bucket = getAvailabilityBucket_(modeKey);
+      if (bucket && dateStr){
+        const list = bucket[dateStr];
+        if (Array.isArray(list) && list.length) return list;
+      }
       if (LIVE_AVAIL && LIVE_AVAIL[modeKey] && dateStr){
         const list = LIVE_AVAIL[modeKey][dateStr];
         if (Array.isArray(list) && list.length) return list;
@@ -1020,7 +1096,13 @@ function buildDeliveryWindowSelect(){
 
       // Preferred: build dates from per-date availability
       let liveDates = null;
-      if (LIVE_AVAIL && LIVE_AVAIL[modeKey] && typeof LIVE_AVAIL[modeKey] === 'object'){
+      const bucket = getAvailabilityBucket_(modeKey);
+      if (bucket && typeof bucket === 'object'){
+        liveDates = Object.keys(bucket || {}).filter(k=>{
+          const arr = bucket[k];
+          return Array.isArray(arr) && arr.length;
+        });
+      } else if (LIVE_AVAIL && LIVE_AVAIL[modeKey] && typeof LIVE_AVAIL[modeKey] === 'object'){
         liveDates = Object.keys(LIVE_AVAIL[modeKey] || {}).filter(k=>{
           const arr = LIVE_AVAIL[modeKey][k];
           return Array.isArray(arr) && arr.length;
@@ -1238,10 +1320,13 @@ function buildDeliveryWindowSelect(){
       const items = validLineItems();
       const subtotal = items.reduce((s,i)=>s+i.line,0);
       const isDelivery = f.fulfillment.value === 'Delivery';
-      const delivery = isDelivery ? DELIVERY_FEE : 0;
+      const totalQty = items.reduce((s,i)=>s+i.q,0);
+      const selectedDeliveryOption = getSelectedDeliveryOption();
+      const baseDeliveryFee = isDelivery ? Number((DELIVERY_OPTIONS[selectedDeliveryOption] || {}).fee || DELIVERY_FEE) : 0;
+      const deliveryMultiplier = isDelivery && totalQty > 4 ? 2 : 1;
+      const delivery = isDelivery ? baseDeliveryFee * deliveryMultiplier : 0;
 
       const advSelected = f.advancePayment.value === 'Yes';
-      const totalQty = items.reduce((s,i)=>s+i.q,0);
       const advanceDiscount = (advSelected && items.length>0) ? (totalQty * ADVANCE_DISCOUNT_PER_BOX) : 0;
 
       const preTaxSubtotal = Math.max(0, subtotal + delivery - advanceDiscount);
@@ -1304,6 +1389,8 @@ function buildDeliveryWindowSelect(){
       if (timeLabelEl) timeLabelEl.innerHTML =
         (isDelivery ? 'Delivery Time Window' : 'Pickup Time Window') + ' <span class="req">*</span>';
 
+      if (pickupLocationWrap) pickupLocationWrap.classList.toggle('hidden', isDelivery);
+      if (deliveryOptionWrap) deliveryOptionWrap.classList.toggle('hidden', !isDelivery);
       if (deliveryAddressWrap) deliveryAddressWrap.classList.toggle('hidden', !isDelivery);
       if (deliveryWindowWrap) deliveryWindowWrap.classList.toggle('hidden', !isDelivery);
       if (timeWrap) timeWrap.classList.toggle('hidden', isDelivery);
@@ -1315,9 +1402,24 @@ function buildDeliveryWindowSelect(){
       const street = document.getElementById('deliveryStreet');
       const city   = document.getElementById('deliveryCity');
       const postal = document.getElementById('deliveryPostal');
-      if (street) street.required = isDelivery;
-      if (city) city.required = isDelivery;
-      if (postal) postal.required = isDelivery;
+      const unit   = document.getElementById('deliveryUnit');
+      const buzzer = document.getElementById('deliveryBuzzer');
+      const search = document.getElementById('deliveryAddressSearch');
+
+      if (street) { street.required = isDelivery; street.disabled = !isDelivery; }
+      if (city) { city.required = isDelivery; city.disabled = !isDelivery; }
+      if (postal) { postal.required = isDelivery; postal.disabled = !isDelivery; }
+      if (unit) unit.disabled = !isDelivery;
+      if (buzzer) buzzer.disabled = !isDelivery;
+      if (search) search.disabled = !isDelivery;
+      if (deliveryWindowSelect) deliveryWindowSelect.disabled = !isDelivery;
+
+      document.querySelectorAll('input[name="pickupLocation"]').forEach(r => {
+        r.disabled = isDelivery;
+      });
+      document.querySelectorAll('input[name="deliveryOption"]').forEach(r => {
+        r.disabled = !isDelivery;
+      });
 
       if (isDelivery) {
         syncDeliveryTime();
@@ -1345,6 +1447,14 @@ function buildDeliveryWindowSelect(){
       if (!f.date.value) { f.date.focus(); return 'Please choose a pickup/delivery date.'; }
 
       const isDelivery = f.fulfillment.value === 'Delivery';
+
+      if (isDelivery) {
+        const selectedDeliveryOption = document.querySelector('input[name="deliveryOption"]:checked');
+        if (!selectedDeliveryOption) return 'Please select a delivery option.';
+      } else {
+        const selectedPickupLocation = document.querySelector('input[name="pickupLocation"]:checked');
+        if (!selectedPickupLocation) return 'Please select a pickup location.';
+      }
 
       const today = new Date(); today.setHours(0,0,0,0);
       const chosenDate = new Date(f.date.value + 'T00:00:00');
@@ -1465,6 +1575,20 @@ function buildDeliveryWindowSelect(){
     document.querySelectorAll('input[name="advancePayment"]').forEach(r =>
       r.addEventListener('change', ()=>{
         amountTouched = false;
+        recalcTotals();
+      })
+    );
+    document.querySelectorAll('input[name="pickupLocation"]').forEach(r =>
+      r.addEventListener('change', ()=>{
+        populateAllowedDates();
+        enforceTimeWindows();
+        recalcTotals();
+      })
+    );
+    document.querySelectorAll('input[name="deliveryOption"]').forEach(r =>
+      r.addEventListener('change', ()=>{
+        populateAllowedDates();
+        enforceTimeWindows();
         recalcTotals();
       })
     );
