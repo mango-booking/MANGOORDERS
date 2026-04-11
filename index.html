@@ -556,8 +556,8 @@ label{
                 <input type="text" name="name" required />
               </div>
               <div>
-                <label>Email <span class="req">*</span></label>
-                <input type="email" name="email" required />
+                <label>Email (optional)</label>
+                <input type="email" name="email" />
               </div>
               <div>
                 <label>Phone Number <span class="req">*</span></label>
@@ -574,7 +574,7 @@ label{
           <div class="section">
             <h3>2) Order Details</h3>
             <div class="mini" style="margin-bottom:6px">
-              Prices — Alphonso $50 · Kesar $40 · Badami $35 · Langra $30 · Dasheri $20
+              Prices — 
             </div>
 
             <div class="items-wrap">
@@ -603,12 +603,40 @@ label{
             <div class="option-group" id="fulfillmentGroup">
               <label class="choice">
                 <input type="radio" name="fulfillment" value="Pickup" checked>
-                <span class="label-text">Pickup for Free</span>
+                <span class="label-text">Pickup</span>
               </label>
               <label class="choice">
                 <input type="radio" name="fulfillment" value="Delivery">
-                <span class="label-text">Delivery for extra $10</span>
+                <span class="label-text">Delivery</span>
               </label>
+            </div>
+
+            <div id="pickupLocationWrap" class="section" style="margin-top:12px">
+              <label>Pickup Location <span class="req">*</span></label>
+              <div class="option-group">
+                <label class="choice">
+                  <input type="radio" name="pickupLocation" value="brampton" checked>
+                  <span class="label-text"><strong>Brampton</strong><br>28 Walbrook road<br>Brampton L6X4N4</span>
+                </label>
+                <label class="choice">
+                  <input type="radio" name="pickupLocation" value="mississauga">
+                  <span class="label-text"><strong>Mississauga</strong><br>Heartland plaza<br>6045 Mavis Rd, Mississauga, ON L5R 4G6</span>
+                </label>
+              </div>
+            </div>
+
+            <div id="deliveryOptionWrap" class="section hidden" style="margin-top:12px">
+              <label>Delivery Option <span class="req">*</span></label>
+              <div class="option-group">
+                <label class="choice">
+                  <input type="radio" name="deliveryOption" value="oakville_scarborough" checked>
+                  <span class="label-text">Delivery of up to four boxes from Oakville to Scarborough will cost $8 in delivery fees.</span>
+                </label>
+                <label class="choice">
+                  <input type="radio" name="deliveryOption" value="kwc_guelph_durham">
+                  <span class="label-text">Delivery of up to four boxes in KWC, Guelph &amp; Durhum Region will cost $10 in delivery fees.</span>
+                </label>
+              </div>
             </div>
 
             <div class="grid3" style="margin-top:10px">
@@ -623,21 +651,13 @@ label{
                 <label id="timeLabel">Pickup Time Window <span class="req">*</span></label>
                 <select id="timeSelect" name="time" required>
                   <option value="">— Select time window —</option>
-                  <option value="09:00">9:00 AM – 12:00 PM</option>
-                  <option value="12:00">12:00 PM – 3:00 PM</option>
-                  <option value="15:00">3:00 PM – 6:00 PM</option>
-                  <option value="18:00">6:00 PM – 8:00 PM</option>
-                </select>
+                   </select>
               </div>
 
               <div id="deliveryWindowWrap" class="hidden">
                 <label>Delivery Time Window <span class="req">*</span></label>
                 <select id="deliveryWindow" name="deliveryWindow">
                   <option value="">— Select time window —</option>
-                  <option value="9:00 AM – 12:00 PM" data-start="09:00">9:00 AM – 12:00 PM</option>
-                  <option value="12:00 PM – 3:00 PM" data-start="12:00">12:00 PM – 3:00 PM</option>
-                  <option value="3:00 PM – 6:00 PM" data-start="15:00">3:00 PM – 6:00 PM</option>
-                  <option value="6:00 PM – 8:00 PM" data-start="18:00">6:00 PM – 8:00 PM</option>
                 </select>
               </div>
 
@@ -789,15 +809,15 @@ label{
     const POST_URL = String(WEB_APP_URL).split('?')[0];
 
     let PRICES = {
-      "Alphonso (Apoos)":50,
-      "Kesar":40,
-      "Badami":35,
-      "Langra":30,
-      "Dasheri":20
+      //"Alphonso (Apoos)":50,
+      //"Kesar":40,
+      //"Badami":35,
+      //"Langra":30,
+      //"Dasheri":20
     };
 
     // Live config (from Config_* sheets)
-    let LIVE_VARIETIES = null;        // array of {name,price,active}
+    let LIVE_VARIETIES = null;        // array of {name,price,active,expectedAvailableDate}
     let LIVE_DATES_PICKUP = null;     // array of YYYY-MM-DD
     let LIVE_DATES_DELIVERY = null;   // array of YYYY-MM-DD
     let SLOTS_PICKUP = null;          // array of {start,label}
@@ -818,9 +838,11 @@ label{
 
         // Varieties/prices
         if (Array.isArray(data.varieties)){
-          LIVE_VARIETIES = data.varieties.filter(v=>v && v.active);
+          LIVE_VARIETIES = data.varieties.filter(v=>v && String((v && v.name) || '').trim());
           const next = {};
-          LIVE_VARIETIES.forEach(v => { next[String(v.name)] = Number(v.price||0); });
+          LIVE_VARIETIES
+            .filter(v => v && v.active)
+            .forEach(v => { next[String(v.name)] = Number(v.price||0); });
           if (Object.keys(next).length) PRICES = next;
         }
 
@@ -864,21 +886,118 @@ label{
       }
     }
 
+    function formatExpectedDateForDisplay(dateStr){
+      if (dateStr === null || typeof dateStr === 'undefined' || dateStr === '') return '';
+
+      if (Object.prototype.toString.call(dateStr) === '[object Date]' && !isNaN(dateStr.getTime())){
+        return dateStr.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'numeric' });
+      }
+
+      const s = String(dateStr || '').trim();
+      if (!s) return '';
+
+      const ymd = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (ymd){
+        const d = new Date(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]));
+        if (!isNaN(d.getTime())){
+          return d.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'numeric' });
+        }
+      }
+
+      const parsed = new Date(s);
+      if (!isNaN(parsed.getTime())){
+        return parsed.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'numeric' });
+      }
+
+      const pretty = s.match(/^[A-Za-z]{3,9}\s+[A-Za-z]{3,9}\s+\d{1,2}\s+\d{4}/);
+      if (pretty) return pretty[0];
+
+      return s.replace(/\s+\d{2}:\d{2}:\d{2}.*$/, '').trim();
+    }
+
+    function getVarietyConfigByName(name){
+      const key = String(name || '').trim();
+      if (!key) return null;
+      if (Array.isArray(LIVE_VARIETIES)){
+        const found = LIVE_VARIETIES.find(v => String(v && v.name || '').trim() === key);
+        if (found) return found;
+      }
+      if (Object.prototype.hasOwnProperty.call(PRICES, key)){
+        return { name:key, price:Number(PRICES[key]||0), active:true, expectedAvailableDate:'' };
+      }
+      return null;
+    }
+
+    function isUnavailableVariety_(name){
+      const found = getVarietyConfigByName(name);
+      return !!(found && found.active === false);
+    }
+
+    function getUnavailableVarietyMessage_(name){
+      const found = getVarietyConfigByName(name);
+      const expected = formatExpectedDateForDisplay(found && (found.expectedAvailableDate || found.expectedDate || ''));
+      return expected
+        ? `Sorry, currently not available. Hopefully we will have it by ${expected}.`
+        : 'Sorry, currently not available.';
+    }
+
+    function buildVarietyOptionsHtml_(current){
+      const currentValue = String(current || '').trim();
+      let optionsHtml = '<option value="" disabled ' + (currentValue ? '' : 'selected') + '>Select…</option>';
+
+      if (Array.isArray(LIVE_VARIETIES) && LIVE_VARIETIES.length){
+        LIVE_VARIETIES.forEach(v=>{
+          const name = String(v && v.name || '').trim();
+          if (!name) return;
+          const isActive = !!(v && v.active);
+          const expected = formatExpectedDateForDisplay(v && (v.expectedAvailableDate || v.expectedDate || ''));
+          const label = isActive
+            ? `${name}`
+            : `${name} — Sorry, currently not available${expected ? ' (Expected: ' + expected + ')' : ''}`;
+          const selected = name === currentValue ? ' selected' : '';
+          const disabled = isActive ? '' : ' disabled';
+          optionsHtml += `<option value="${name.replace(/"/g, '&quot;')}"${selected}${disabled}>${label}</option>`;
+        });
+        return optionsHtml;
+      }
+
+      for (const v in PRICES){
+        optionsHtml += `<option${v===currentValue ? ' selected' : ''}>${v}</option>`;
+      }
+      return optionsHtml;
+    }
+
     function refreshVarietySelects(){
       const selects = document.querySelectorAll('#itemsTable select');
       selects.forEach(sel=>{
         const current = sel.value;
-        let optionsHtml = '<option disabled ' + (current ? '' : 'selected') + '>Select…</option>';
-        for (const v in PRICES){
-          optionsHtml += `<option${v===current ? ' selected' : ''}>${v}</option>`;
-        }
-        sel.innerHTML = optionsHtml;
-        if (!(current in PRICES)) sel.value = '';
+        sel.innerHTML = buildVarietyOptionsHtml_(current);
+        if (current && !getVarietyConfigByName(current)) sel.value = '';
       });
       // prices per-row get recalculated by recalcTotals() later
     }
 
     const DELIVERY_FEE = 10;
+    const DELIVERY_OPTIONS = {
+      oakville_scarborough: {
+        label: 'Delivery of up to four boxes from Oakville to Scarborough will cost $8 in delivery fees.',
+        fee: 8
+      },
+      kwc_guelph_durham: {
+        label: 'Delivery of up to four boxes in KWC, Guelph & Durhum Region will cost $10 in delivery fees.',
+        fee: 10
+      }
+    };
+    const PICKUP_LOCATIONS = {
+      brampton: {
+        label: 'Brampton',
+        address: '28 Walbrook road, Brampton L6X4N4'
+      },
+      mississauga: {
+        label: 'Mississauga',
+        address: 'Heartland plaza, 6045 Mavis Rd, Mississauga, ON L5R 4G6'
+      }
+    };
     const TAX_RATE = 0;
     const TAX_ON_DELIVERY = true;
     const ADVANCE_DISCOUNT_PER_BOX = 1;
@@ -889,6 +1008,8 @@ label{
     const itemsBody = document.getElementById('itemsBody');
     const addRowBtn = document.getElementById('addRowBtn');
     const deliveryWindowWrap = document.getElementById('deliveryWindowWrap');
+    const pickupLocationWrap = document.getElementById('pickupLocationWrap');
+    const deliveryOptionWrap = document.getElementById('deliveryOptionWrap');
     const paymentFields = document.getElementById('paymentFields');
     const submitBtn = document.getElementById('submitBtn');
     const timeWrap = document.getElementById('timeWrap');
@@ -925,18 +1046,44 @@ label{
     }
 
     const TIME_WINDOWS = [
-      {start:"09:00", label:"9:00 AM – 12:00 PM"},
-      {start:"12:00", label:"12:00 PM – 3:00 PM"},
-      {start:"15:00", label:"3:00 PM – 6:00 PM"},
-      {start:"18:00", label:"6:00 PM – 8:00 PM"},
+      //{start:"09:00", label:"9:00 AM – 12:00 PM"},
+      //{start:"12:00", label:"12:00 PM – 3:00 PM"},
+      //{start:"15:00", label:"3:00 PM – 6:00 PM"},
+      //{start:"18:00", label:"6:00 PM – 8:00 PM"},
     ];
 
     function formatDateForOption(d){
       return d.toLocaleDateString(undefined, {weekday:'short', year:'numeric', month:'short', day:'numeric'});
     }
 
+    function getSelectedPickupLocation(){
+      return document.querySelector('input[name="pickupLocation"]:checked')?.value || 'brampton';
+    }
+
+    function getSelectedDeliveryOption(){
+      return document.querySelector('input[name="deliveryOption"]:checked')?.value || 'oakville_scarborough';
+    }
+
+    function getAvailabilityBucket_(modeKey){
+      if (!LIVE_AVAIL || !LIVE_AVAIL[modeKey]) return null;
+      const group = LIVE_AVAIL[modeKey];
+      if (modeKey === 'pickup'){
+        const selected = getSelectedPickupLocation();
+        if (group[selected] && typeof group[selected] === 'object' && !Array.isArray(group[selected])) return group[selected];
+      }
+      if (modeKey === 'delivery'){
+        const selected = getSelectedDeliveryOption();
+        if (group[selected] && typeof group[selected] === 'object' && !Array.isArray(group[selected])) return group[selected];
+      }
+      return group;
+    }
+
     function getSlotsFor_(modeKey, dateStr){
-      // modeKey: 'pickup' | 'delivery'
+      const bucket = getAvailabilityBucket_(modeKey);
+      if (bucket && dateStr){
+        const list = bucket[dateStr];
+        if (Array.isArray(list) && list.length) return list;
+      }
       if (LIVE_AVAIL && LIVE_AVAIL[modeKey] && dateStr){
         const list = LIVE_AVAIL[modeKey][dateStr];
         if (Array.isArray(list) && list.length) return list;
@@ -1028,7 +1175,13 @@ function buildDeliveryWindowSelect(){
 
       // Preferred: build dates from per-date availability
       let liveDates = null;
-      if (LIVE_AVAIL && LIVE_AVAIL[modeKey] && typeof LIVE_AVAIL[modeKey] === 'object'){
+      const bucket = getAvailabilityBucket_(modeKey);
+      if (bucket && typeof bucket === 'object'){
+        liveDates = Object.keys(bucket || {}).filter(k=>{
+          const arr = bucket[k];
+          return Array.isArray(arr) && arr.length;
+        });
+      } else if (LIVE_AVAIL && LIVE_AVAIL[modeKey] && typeof LIVE_AVAIL[modeKey] === 'object'){
         liveDates = Object.keys(LIVE_AVAIL[modeKey] || {}).filter(k=>{
           const arr = LIVE_AVAIL[modeKey][k];
           return Array.isArray(arr) && arr.length;
@@ -1173,11 +1326,7 @@ function buildDeliveryWindowSelect(){
       const tdVar = document.createElement('td');
       const sel = document.createElement('select');
       sel.name='itemVariety[]'; sel.required=true;
-      let optionsHtml = '<option value="" disabled ' + (variety ? '' : 'selected') + '>Select…</option>';
-      for (const v in PRICES){
-        optionsHtml += `<option${v===variety ? ' selected' : ''}>${v}</option>`;
-      }
-      sel.innerHTML = optionsHtml;
+      sel.innerHTML = buildVarietyOptionsHtml_(variety);
       tdVar.appendChild(sel);
 
       const tdPrice = document.createElement('td');
@@ -1210,7 +1359,12 @@ function buildDeliveryWindowSelect(){
 
       function recalcRow(){
         const vv = sel.value;
-        const p = PRICES[vv] || 0;
+        if (vv && isUnavailableVariety_(vv)){
+          alert(getUnavailableVarietyMessage_(vv));
+          sel.value = '';
+        }
+        const activeValue = sel.value;
+        const p = PRICES[activeValue] || 0;
         const q = Number(qtyInput.value || 0);
         priceSpan.textContent = fmt(p);
         lineSpan.textContent = fmt(p*q);
@@ -1234,7 +1388,7 @@ function buildDeliveryWindowSelect(){
       rows.forEach(tr => {
         const v = tr.querySelector('select').value;
         const q = Number(tr.querySelector('input').value || 0);
-        if (v && q>0){
+        if (v && q>0 && !isUnavailableVariety_(v)){
           const unit = PRICES[v] || 0;
           items.push({v,q,unit,line:unit*q});
         }
@@ -1246,10 +1400,13 @@ function buildDeliveryWindowSelect(){
       const items = validLineItems();
       const subtotal = items.reduce((s,i)=>s+i.line,0);
       const isDelivery = f.fulfillment.value === 'Delivery';
-      const delivery = isDelivery ? DELIVERY_FEE : 0;
+      const totalQty = items.reduce((s,i)=>s+i.q,0);
+      const selectedDeliveryOption = getSelectedDeliveryOption();
+      const baseDeliveryFee = isDelivery ? Number((DELIVERY_OPTIONS[selectedDeliveryOption] || {}).fee || DELIVERY_FEE) : 0;
+      const deliveryMultiplier = isDelivery && totalQty > 4 ? 2 : 1;
+      const delivery = isDelivery ? baseDeliveryFee * deliveryMultiplier : 0;
 
       const advSelected = f.advancePayment.value === 'Yes';
-      const totalQty = items.reduce((s,i)=>s+i.q,0);
       const advanceDiscount = (advSelected && items.length>0) ? (totalQty * ADVANCE_DISCOUNT_PER_BOX) : 0;
 
       const preTaxSubtotal = Math.max(0, subtotal + delivery - advanceDiscount);
@@ -1312,6 +1469,8 @@ function buildDeliveryWindowSelect(){
       if (timeLabelEl) timeLabelEl.innerHTML =
         (isDelivery ? 'Delivery Time Window' : 'Pickup Time Window') + ' <span class="req">*</span>';
 
+      if (pickupLocationWrap) pickupLocationWrap.classList.toggle('hidden', isDelivery);
+      if (deliveryOptionWrap) deliveryOptionWrap.classList.toggle('hidden', !isDelivery);
       if (deliveryAddressWrap) deliveryAddressWrap.classList.toggle('hidden', !isDelivery);
       if (deliveryWindowWrap) deliveryWindowWrap.classList.toggle('hidden', !isDelivery);
       if (timeWrap) timeWrap.classList.toggle('hidden', isDelivery);
@@ -1323,9 +1482,24 @@ function buildDeliveryWindowSelect(){
       const street = document.getElementById('deliveryStreet');
       const city   = document.getElementById('deliveryCity');
       const postal = document.getElementById('deliveryPostal');
-      if (street) street.required = isDelivery;
-      if (city) city.required = isDelivery;
-      if (postal) postal.required = isDelivery;
+      const unit   = document.getElementById('deliveryUnit');
+      const buzzer = document.getElementById('deliveryBuzzer');
+      const search = document.getElementById('deliveryAddressSearch');
+
+      if (street) { street.required = isDelivery; street.disabled = !isDelivery; }
+      if (city) { city.required = isDelivery; city.disabled = !isDelivery; }
+      if (postal) { postal.required = isDelivery; postal.disabled = !isDelivery; }
+      if (unit) unit.disabled = !isDelivery;
+      if (buzzer) buzzer.disabled = !isDelivery;
+      if (search) search.disabled = !isDelivery;
+      if (deliveryWindowSelect) deliveryWindowSelect.disabled = !isDelivery;
+
+      document.querySelectorAll('input[name="pickupLocation"]').forEach(r => {
+        r.disabled = isDelivery;
+      });
+      document.querySelectorAll('input[name="deliveryOption"]').forEach(r => {
+        r.disabled = !isDelivery;
+      });
 
       if (isDelivery) {
         syncDeliveryTime();
@@ -1345,7 +1519,7 @@ function buildDeliveryWindowSelect(){
       const phone = (f.phone.value || '').trim();
 
       if (!name) { f.name.focus(); return 'Please enter your full name.'; }
-      if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
         f.email.focus(); return 'Please enter a valid email address.'; }
       const digits = phone.replace(/\D/g,'');
       if (digits.length < 10) { f.phone.focus(); return 'Please enter a valid phone number.'; }
@@ -1353,6 +1527,14 @@ function buildDeliveryWindowSelect(){
       if (!f.date.value) { f.date.focus(); return 'Please choose a pickup/delivery date.'; }
 
       const isDelivery = f.fulfillment.value === 'Delivery';
+
+      if (isDelivery) {
+        const selectedDeliveryOption = document.querySelector('input[name="deliveryOption"]:checked');
+        if (!selectedDeliveryOption) return 'Please select a delivery option.';
+      } else {
+        const selectedPickupLocation = document.querySelector('input[name="pickupLocation"]:checked');
+        if (!selectedPickupLocation) return 'Please select a pickup location.';
+      }
 
       const today = new Date(); today.setHours(0,0,0,0);
       const chosenDate = new Date(f.date.value + 'T00:00:00');
@@ -1375,6 +1557,16 @@ function buildDeliveryWindowSelect(){
           return isDelivery ? 'Delivery time cannot be in the past.' :
                               'Pickup time cannot be in the past.';
         }
+      }
+
+      const unavailableSelect = Array.from(itemsBody.querySelectorAll('tr select')).find(sel => {
+        const value = String(sel.value || '').trim();
+        return value && isUnavailableVariety_(value);
+      });
+      if (unavailableSelect){
+        unavailableSelect.focus();
+        alert(getUnavailableVarietyMessage_(unavailableSelect.value));
+        return 'Please select an available mango variety.';
       }
 
       if (validLineItems().length === 0) {
@@ -1473,6 +1665,20 @@ function buildDeliveryWindowSelect(){
     document.querySelectorAll('input[name="advancePayment"]').forEach(r =>
       r.addEventListener('change', ()=>{
         amountTouched = false;
+        recalcTotals();
+      })
+    );
+    document.querySelectorAll('input[name="pickupLocation"]').forEach(r =>
+      r.addEventListener('change', ()=>{
+        populateAllowedDates();
+        enforceTimeWindows();
+        recalcTotals();
+      })
+    );
+    document.querySelectorAll('input[name="deliveryOption"]').forEach(r =>
+      r.addEventListener('change', ()=>{
+        populateAllowedDates();
+        enforceTimeWindows();
         recalcTotals();
       })
     );
@@ -1617,7 +1823,9 @@ function stopPoll(){
             card.innerHTML =
               '<div class="thankyou-box">' +
                 '<h2>Thank you for your order! 🥭</h2>' +
-                '<p>Your booking has been received. A confirmation email with your invoice has been sent.</p>' +
+                '<p>' + ((f.email.value || '').trim()
+                  ? 'Your booking has been received. A confirmation email with your invoice has been sent.'
+                  : 'Your booking has been received successfully.') + '</p>' +
                 '<img src="images/mango-kids-juice.png" alt="Kids happily enjoying mango juice" class="thankyou-img">' +
               '</div>';
           }
@@ -1700,7 +1908,9 @@ window.addEventListener('message', (ev) => {
         card.innerHTML =
           '<div class="thankyou">' +
             '<h2>Thank you for your order! 🥭</h2>' +
-            '<p>Your booking has been received. A confirmation email with your invoice has been sent.</p>' +
+            '<p>' + ((f.email.value || '').trim()
+                  ? 'Your booking has been received. A confirmation email with your invoice has been sent.'
+                  : 'Your booking has been received successfully.') + '</p>' +
             '<img src="images/mango-kids-juice.png" ' +
               'alt="Kids happily enjoying mango juice" class="thankyou-img">' +
           '</div>';
@@ -1768,6 +1978,6 @@ window.addEventListener('message', (ev) => {
        1) Replace YOUR_GOOGLE_MAPS_API_KEY below
        2) Make sure "Places API" is enabled for the key
   -->
-  <script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDQcPWPhpc_Dlr-d1RWnyOU7Srft-zPZ2o&libraries=places&callback=initAddressAutocomplete"></script>
+  <script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAFLRsXkbUHbbvf4Dygi-4XkizW83rPbNg&libraries=places&callback=initAddressAutocomplete"></script>
 </body>
 </html>
